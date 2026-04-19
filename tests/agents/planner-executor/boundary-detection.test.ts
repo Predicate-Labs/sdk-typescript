@@ -2,7 +2,6 @@
  * Tests for boundary detection (auth pages, checkout pages).
  */
 
-import { describe, it, expect } from 'vitest';
 import {
   detectAuthBoundary,
   detectCheckoutPage,

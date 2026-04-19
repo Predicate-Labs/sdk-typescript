@@ -2,7 +2,6 @@
  * Tests for modal/overlay dismissal logic.
  */
 
-import { describe, it, expect } from 'vitest';
 import {
   findDismissalTarget,
   detectModalAppearance,

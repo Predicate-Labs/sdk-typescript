@@ -2,7 +2,6 @@
  * Tests for Predicate System
  */
 
-import { describe, it, expect } from 'vitest';
 import {
   urlContains,
   urlMatches,

@@ -2,7 +2,6 @@
  * Tests for Intent Heuristics
  */
 
-import { describe, it, expect } from 'vitest';
 import type { SnapshotElement } from '../../../src/agents/planner-executor/plan-models';
 
 // We need to test the SimpleIntentHeuristics class, but it's not exported.

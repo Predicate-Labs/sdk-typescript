@@ -2,7 +2,6 @@
  * Tests for vision fallback detection.
  */
 
-import { describe, it, expect } from 'vitest';
 import {
   detectSnapshotFailure,
   shouldUseVision,
