@@ -1063,6 +1063,14 @@ export class PlannerExecutorAgent {
           finalOutcome.status === StepStatus.SKIPPED ||
           finalOutcome.status === StepStatus.VISION_FALLBACK
         ) {
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            (await this.isCartAdditionTerminal(runtime, task, plannerAction))
+          ) {
+            success = true;
+          }
+
           if (this.recoveryState && this.config.recovery.trackSuccessfulUrls && urlAfter) {
             this.recoveryState.recordCheckpoint({
               url: urlAfter,
@@ -1081,6 +1089,10 @@ export class PlannerExecutorAgent {
         this.emitStepEnd(stepTraceId, stepNum, plannerAction, finalOutcome);
 
         if (error) {
+          break;
+        }
+
+        if (success) {
           break;
         }
 
@@ -2252,6 +2264,60 @@ export class PlannerExecutorAgent {
     }
 
     return false;
+  }
+
+  private async isCartAdditionTerminal(
+    runtime: AgentRuntime,
+    task: string,
+    plannerAction: StepwisePlannerResponse
+  ): Promise<boolean> {
+    const taskText = task.toLowerCase();
+    if (
+      !/\badd(?:ed)?\b[\s\S]*\bcart\b|\bcart[_\s-]?addition\b/.test(taskText) ||
+      /\bcheckout\b|\bcheck out\b|\bpayment\b|\bplace order\b|\bbuy now\b/.test(taskText)
+    ) {
+      return false;
+    }
+
+    const actionText = [
+      plannerAction.intent,
+      plannerAction.input,
+      plannerAction.goal,
+      plannerAction.action,
+    ]
+      .filter((value): value is string => typeof value === 'string')
+      .join(' ')
+      .toLowerCase()
+      .replace(/[_-]+/g, ' ');
+
+    if (!/\badd(?:ed)?\b[\s\S]*\bcart\b|\bcart contains\b/.test(actionText)) {
+      return false;
+    }
+
+    try {
+      const snap = await runtime.snapshot({
+        limit: this.config.snapshot.limitBase,
+        screenshot: false,
+        goal: 'cart addition confirmation',
+      });
+      if (!snap) {
+        return false;
+      }
+
+      return (snap.elements || []).some(element => {
+        const label = [element.text, element.ariaLabel, element.name]
+          .filter((value): value is string => typeof value === 'string')
+          .join(' ')
+          .toLowerCase();
+        return (
+          /\badded to (?:cart|bag|basket)\b/.test(label) ||
+          /\bcart contains\s+[1-9]\d*\s+items?\b/.test(label) ||
+          /\b[1-9]\d*\s+items?\s+in (?:your )?(?:cart|bag|basket)\b/.test(label)
+        );
+      });
+    } catch {
+      return false;
+    }
   }
 
   private async attemptRecovery(runtime: AgentRuntime): Promise<boolean> {

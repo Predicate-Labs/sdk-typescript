@@ -7,6 +7,7 @@ import {
 
 class ProviderStub extends LLMProvider {
   private responses: string[];
+  public generateCalls = 0;
 
   constructor(responses: string[] = []) {
     super();
@@ -22,6 +23,7 @@ class ProviderStub extends LLMProvider {
   }
 
   async generate(): Promise<LLMResponse> {
+    this.generateCalls += 1;
     const content = this.responses.length
       ? this.responses.shift()!
       : JSON.stringify({ action: 'DONE' });
@@ -198,6 +200,57 @@ describe('PlannerExecutorAgent modal flow parity', () => {
     expect(result.success).toBe(true);
     expect(runtime.clickCalls).toEqual([1, 9]);
     expect(runtime.currentUrl).toContain('/checkout');
+  });
+
+  it('finishes an add-to-cart task when the cart count confirms success', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'add_to_cart',
+        input: 'Add to Cart',
+        verify: [],
+        required: true,
+      }),
+    ]);
+    const executor = new ProviderStub(['CLICK(1)']);
+    let stage: 'product' | 'cart-confirmed' = 'product';
+    const runtime = new RuntimeStub(
+      'https://shop.test/product',
+      () => {
+        if (stage === 'cart-confirmed') {
+          return makeSnapshot('https://shop.test/product', [
+            { id: 1, role: 'button', text: 'Add to Cart', clickable: true, importance: 100 },
+            {
+              id: 9,
+              role: 'button',
+              text: 'Cart contains 1 item Total $59.99',
+              clickable: true,
+              importance: 110,
+            },
+            { id: 10, role: 'text', text: 'Added to cart', importance: 90 },
+          ]);
+        }
+        return makeSnapshot('https://shop.test/product', [
+          { id: 1, role: 'button', text: 'Add to Cart', clickable: true, importance: 100 },
+        ]);
+      },
+      {
+        onClick: elementId => {
+          if (elementId === 1) {
+            stage = 'cart-confirmed';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({ planner, executor });
+    const result = await agent.runStepwise(runtime, {
+      task: 'Search for running shoes and add the item to cart',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.clickCalls).toEqual([1]);
+    expect(planner.generateCalls).toBe(1);
   });
 
   it('does not dismiss or auto-continue drawers with checkout or cart controls for unrelated clicks', async () => {
