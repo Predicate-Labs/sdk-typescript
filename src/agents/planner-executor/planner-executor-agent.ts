@@ -1437,6 +1437,7 @@ export class PlannerExecutorAgent {
         const elements = activeCtx.snapshot?.elements || [];
         const inputElement = elements.find(element => element.id === elementId) || null;
         const isSearchLike = isSearchLikeTypeAndSubmit(plannerAction, inputElement);
+        let submissionSatisfied = false;
 
         // Submit with Enter key for TYPE_AND_SUBMIT, plus planner TYPE actions that clearly target search.
         if (
@@ -1448,7 +1449,6 @@ export class PlannerExecutorAgent {
           const hasRetryBudget = this.config.retry.executorRepairAttempts > 0;
 
           let changedUrl: string | null = null;
-          let submissionSatisfied = false;
 
           const checkSubmissionSatisfied = async (): Promise<boolean> => {
             if (
@@ -1535,7 +1535,8 @@ export class PlannerExecutorAgent {
           }
         }
 
-        const verificationPassed = await this.verifyStepOutcome(runtime, plannerAction);
+        const verificationPassed =
+          submissionSatisfied || (await this.verifyStepOutcome(runtime, plannerAction));
         const urlAfter = await runtime.getCurrentUrl();
 
         return {

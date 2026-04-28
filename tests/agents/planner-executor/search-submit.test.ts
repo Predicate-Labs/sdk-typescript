@@ -309,6 +309,57 @@ describe('PlannerExecutorAgent search submission parity', () => {
     expect(executor.calls).toHaveLength(0);
   });
 
+  it('treats a relevant search URL change as success even when planner verification is too strict', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'TYPE_AND_SUBMIT',
+        intent: 'searchbox',
+        input: 'noise canceling earbuds',
+        verify: [{ predicate: 'url_contains', args: ['/search'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'search submitted' }),
+    ]);
+    const executor = new ProviderStub(['NONE']);
+    const runtime = new RuntimeStub(
+      'https://www.amazon.com/',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          {
+            id: 10,
+            role: 'searchbox',
+            name: 'Search Amazon',
+            ariaLabel: 'Search Amazon',
+            text: 'field-keywords',
+            importance: 100,
+          },
+          { id: 11, role: 'button', text: 'Go', clickable: true, importance: 90 },
+        ]),
+      {
+        onPressKey: () => {
+          runtime.currentUrl = 'https://www.amazon.com/s?k=noise+canceling+earbuds&ref=nb_sb_noss';
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Search for noise canceling earbuds, then pick a product',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0].status).toBe(StepStatus.SUCCESS);
+    expect(result.stepOutcomes[0].verificationPassed).toBe(true);
+    expect(runtime.currentUrl).toContain('/s?k=noise+canceling+earbuds');
+  });
+
   it('does not retry submission when Enter satisfies verification without changing the URL', async () => {
     const planner = new ProviderStub([
       JSON.stringify({
