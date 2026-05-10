@@ -659,6 +659,7 @@ describe('PlannerExecutorAgent parity', () => {
             return;
           }
           if (id === 2) {
+            runtime.currentUrl = 'https://shop.test/error';
             throw new Error('click failed');
           }
         },

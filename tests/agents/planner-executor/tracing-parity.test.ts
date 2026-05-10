@@ -319,7 +319,7 @@ describe('PlannerExecutorAgent tracing parity', () => {
       }),
       JSON.stringify({ action: 'DONE', reasoning: 'replanned after recovery failed' }),
     ]);
-    const executor = new ProviderStub(['NONE']);
+    const executor = new ProviderStub(['CLICK(7)', 'CLICK(7)']);
     const traceSink = new MemoryTraceSink();
     const tracer = new Tracer('trace-replan', traceSink);
     let recoveryBroken = false;

@@ -233,14 +233,6 @@ describe('Composable heuristics integration', () => {
         action: 'CLICK',
         intent: 'continue',
         input: 'Continue',
-        heuristic_hints: [
-          {
-            intent_pattern: 'continue',
-            text_patterns: ['continue'],
-            role_filter: ['button'],
-            priority: 10,
-          },
-        ],
       }),
       JSON.stringify({ action: 'DONE' }),
     ]);
