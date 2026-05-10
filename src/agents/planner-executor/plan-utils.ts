@@ -361,6 +361,7 @@ const ACTION_ALIASES: Record<string, string> = {
   SCROLL_DOWN: 'SCROLL',
   SCROLL_UP: 'SCROLL',
   SCROLL_TO: 'SCROLL',
+  SCROLL_INTO_VIEW: 'SCROLL',
 };
 
 /**

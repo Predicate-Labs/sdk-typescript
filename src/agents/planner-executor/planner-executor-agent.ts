@@ -1211,7 +1211,7 @@ export class PlannerExecutorAgent {
             action: plannerAction.action,
             target: this.summarizePlannerActionTarget(plannerAction),
             intent: plannerAction.intent || null,
-            result: finalOutcome.status === StepStatus.SUCCESS ? 'success' : 'failed',
+            result: this.actionHistoryResult(finalOutcome.status),
             urlAfter,
             extractedData: extractedText || undefined,
           });
@@ -1290,6 +1290,12 @@ export class PlannerExecutorAgent {
         const recentFailures = stepOutcomes.slice(-3).filter(o => o.status === StepStatus.FAILED);
         if (recentFailures.length >= 3) {
           error = 'Too many consecutive failures';
+          break;
+        }
+
+        const repeatedCompletedFormSkip = this.detectRepeatedCompletedFormSkip(stepOutcomes);
+        if (repeatedCompletedFormSkip) {
+          error = repeatedCompletedFormSkip;
           break;
         }
 
@@ -2125,6 +2131,21 @@ export class PlannerExecutorAgent {
               activeCtx.snapshot,
               postClickSnapshot
             );
+            if (!verificationPassed) {
+              verificationPassed = this.inferTerminalFormSubmissionAfterClick(
+                plannerAction,
+                targetElement,
+                activeCtx.snapshot,
+                postClickSnapshot
+              );
+            }
+            if (!verificationPassed) {
+              verificationPassed = this.inferFormChoiceSelectionAfterClick(
+                plannerAction,
+                targetElement,
+                postClickSnapshot
+              );
+            }
           }
         }
 
@@ -3287,12 +3308,23 @@ export class PlannerExecutorAgent {
         action: substep.action,
         target: this.summarizePlannerActionTarget(substep),
         intent: substep.intent || null,
-        result: substepOutcome.status === StepStatus.SUCCESS ? 'success' : 'failed',
+        result: this.actionHistoryResult(substepOutcome.status),
         urlAfter: substepOutcome.urlAfter || (await runtime.getCurrentUrl()),
       });
     }
 
     return substepOutcomes;
+  }
+
+  private actionHistoryResult(status: StepStatus): string {
+    if (
+      status === StepStatus.SUCCESS ||
+      status === StepStatus.SKIPPED ||
+      status === StepStatus.VISION_FALLBACK
+    ) {
+      return status;
+    }
+    return 'failed';
   }
 
   private async checkPreStepVerification(
@@ -3470,6 +3502,46 @@ export class PlannerExecutorAgent {
     }
 
     return null;
+  }
+
+  private detectRepeatedCompletedFormSkip(stepOutcomes: StepOutcome[]): string | null {
+    if (stepOutcomes.length < 3) {
+      return null;
+    }
+
+    const recent = stepOutcomes.slice(-3);
+    if (
+      !recent.every(
+        outcome =>
+          outcome.status === StepStatus.SKIPPED &&
+          outcome.actionTaken === 'SKIPPED(previously_completed_form_step)'
+      )
+    ) {
+      return null;
+    }
+
+    const intentKeys = recent.map(outcome => this.normalizeCompletedFormIntent(outcome.goal || ''));
+    if (intentKeys.some(intent => !intent || !this.isFormDataEntryIntent(intent))) {
+      return null;
+    }
+
+    const firstIntent = intentKeys[0];
+    const repeatedIntent = intentKeys.every(intent =>
+      this.completedFormIntentsMatch(firstIntent, intent)
+    );
+    if (!repeatedIntent) {
+      return null;
+    }
+
+    const urls = recent.map(outcome => outcome.urlAfter || outcome.urlBefore || '').filter(Boolean);
+    const sameUrl =
+      urls.length === recent.length &&
+      new Set(urls.map(url => this.normalizeNavigationUrl(url))).size === 1;
+    if (!sameUrl) {
+      return null;
+    }
+
+    return `Planner repeated already completed form step "${recent[0].goal}" without moving to the next incomplete goal`;
   }
 
   private urlHostKey(url: string): string {
@@ -3974,7 +4046,9 @@ export class PlannerExecutorAgent {
 
     const clickText = clickedElement ? this.elementText(clickedElement) : '';
     const plannerText = `${plannerAction.intent || ''} ${plannerAction.goal || ''}`.toLowerCase();
-    if (!/\b(next|continue)\b/.test(`${clickText} ${plannerText}`)) {
+    const plannerRequestedForwardNavigation = /\b(next|continue)\b/.test(plannerText);
+    const clickedForwardNavigation = this.isForwardNavigationControlText(clickText);
+    if (!plannerRequestedForwardNavigation || !clickedForwardNavigation) {
       return false;
     }
 
@@ -3996,6 +4070,125 @@ export class PlannerExecutorAgent {
     );
 
     return hasBack && hasForwardOrSubmit;
+  }
+
+  private inferTerminalFormSubmissionAfterClick(
+    plannerAction: StepwisePlannerResponse,
+    clickedElement: SnapshotElement | null,
+    beforeSnapshot: Snapshot | null,
+    afterSnapshot: Snapshot
+  ): boolean {
+    if (plannerAction.action !== 'CLICK') {
+      return false;
+    }
+
+    const clickText = clickedElement ? this.elementText(clickedElement) : '';
+    const plannerText = `${plannerAction.intent || ''} ${plannerAction.goal || ''}`.toLowerCase();
+    const plannerRequestedSubmission = this.isTerminalSubmissionText(plannerText);
+    const clickedSubmissionControl = this.isTerminalSubmissionControlText(clickText);
+    if (!plannerRequestedSubmission || !clickedSubmissionControl) {
+      return false;
+    }
+
+    const afterElements = afterSnapshot.elements || [];
+    if (afterElements.length === 0 || this.hasFormValidationError(afterElements)) {
+      return false;
+    }
+
+    const beforePageText = (beforeSnapshot?.elements || [])
+      .map(element => this.elementText(element))
+      .join(' ');
+    const pageText = afterElements.map(element => this.elementText(element)).join(' ');
+    const confirmationPattern =
+      /\b(thanks?|thank you|submitted|complete|completed|success|received|confirmation)\b/i;
+    if (confirmationPattern.test(pageText) && !confirmationPattern.test(beforePageText)) {
+      return true;
+    }
+
+    const beforeSignature = this.formPaneSignature(beforeSnapshot?.elements || []);
+    const afterSignature = this.formPaneSignature(afterElements);
+    if (beforeSignature && beforeSignature === afterSignature) {
+      return false;
+    }
+
+    if (confirmationPattern.test(pageText)) {
+      return true;
+    }
+
+    const hasForwardOrTerminalControl = afterElements.some(element =>
+      /^(next|continue|submit)$/i.test(this.elementText(element))
+    );
+    return beforeSignature.length > 0 && !hasForwardOrTerminalControl;
+  }
+
+  private isForwardNavigationControlText(text: string): boolean {
+    return /^(next|continue)$/i.test(text.trim());
+  }
+
+  private isTerminalSubmissionText(text: string): boolean {
+    return /\b(submit|send|confirm|complete|completed|done|finish|register|sign\s*up|signup|create account|place order)\b/i.test(
+      text
+    );
+  }
+
+  private isTerminalSubmissionControlText(text: string): boolean {
+    const normalized = text.trim();
+    return (
+      this.isTerminalSubmissionText(normalized) && !this.isForwardNavigationControlText(normalized)
+    );
+  }
+
+  private inferFormChoiceSelectionAfterClick(
+    plannerAction: StepwisePlannerResponse,
+    clickedElement: SnapshotElement | null,
+    afterSnapshot: Snapshot
+  ): boolean {
+    if (plannerAction.action !== 'CLICK' || !clickedElement) {
+      return false;
+    }
+
+    const role = (clickedElement.role || '').toLowerCase();
+    if (role !== 'radio' && role !== 'checkbox') {
+      return false;
+    }
+
+    const afterElements = afterSnapshot.elements || [];
+    if (afterElements.length === 0 || this.hasFormValidationError(afterElements)) {
+      return false;
+    }
+
+    const clickedText = this.elementText(clickedElement);
+    const plannerText = `${plannerAction.intent || ''} ${plannerAction.goal || ''}`.toLowerCase();
+    return this.selectionControlMatchesIntent(clickedText, plannerText);
+  }
+
+  private selectionControlMatchesIntent(controlText: string, intentText: string): boolean {
+    const controlWords = new Set(
+      controlText
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter(word => word.length >= 3)
+    );
+    if (controlWords.size === 0) {
+      return false;
+    }
+
+    const ignoredIntentWords = new Set([
+      'button',
+      'checkbox',
+      'radio',
+      'field',
+      'input',
+      'select',
+      'choose',
+      'click',
+      'option',
+    ]);
+    const intentWords = intentText
+      .split(/[^a-z0-9]+/)
+      .filter(word => word.length >= 3 && !ignoredIntentWords.has(word));
+
+    return intentWords.some(word => controlWords.has(word));
   }
 
   private formPaneSignature(elements: SnapshotElement[]): string {

@@ -107,7 +107,8 @@ RULES:
 10. Do NOT return DONE until ALL parts of the goal are complete
 11. Never copy example URLs from these instructions. Only NAVIGATE to a URL from the user's task, the current page, or a visible element.
 12. For multi-step forms: TYPE into each field (action: TYPE) BEFORE clicking Next. Never click Next without filling required fields first.
-13. "intent" must be SPECIFIC: describe the element with its label or context (e.g., "email field", "plan dropdown", "Next button on step 2")`;
+13. "intent" must be SPECIFIC: describe the element with its label or context (e.g., "email field", "plan dropdown", "Next button on step 2")
+14. Treat history results "success", "skipped", and "vision_fallback" as already satisfied. Do not repeat those steps; choose the next incomplete part of the goal.`;
 
   // Inject extraction-specific guidance when the goal is an extraction task
   const extractionGuidance = isExtractionTask(goal) ? getExtractionDomainGuidance() : '';
