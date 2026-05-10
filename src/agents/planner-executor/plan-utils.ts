@@ -182,6 +182,17 @@ function stripThinkingTags(content: string): string {
 function repairJson(text: string): string {
   let repaired = text;
 
+  // Fix backslash-escaped quotes that make JSON unparseable.
+  // Some LLMs output: {"action":"CLICK",...,\"reasoning\":\"text\"}
+  // where the outer quotes are real but inner key/value quotes are escaped.
+  // Heuristic: if the text has unescaped quotes AND backslash-escaped quotes
+  // mixed together, unescape the backslash-escaped ones.
+  const hasUnescapedQuotes = /[^\\]"/.test(repaired);
+  const hasEscapedQuotes = /\\"/.test(repaired);
+  if (hasUnescapedQuotes && hasEscapedQuotes) {
+    repaired = repaired.replace(/\\"/g, '"');
+  }
+
   // Add double quotes around unquoted object keys
   // Matches: word-characters followed by colon (not already inside a string)
   // Pattern: start of object `{` or comma `,`, optional whitespace, then unquoted key, then `:`
@@ -189,7 +200,7 @@ function repairJson(text: string): string {
 
   // Replace single-quoted strings with double-quoted strings
   // This is a simple heuristic — it won't handle escaped single quotes inside strings,
-  // but it handles the common case of LLMs outputting `'text'` instead of `"text"`
+  // but it handles the common case of LLMs outputting 'text' instead of "text"
   repaired = repaired.replace(/'([^']*)'/g, '"$1"');
 
   // Remove trailing commas before } or ]
@@ -338,6 +349,8 @@ const ACTION_ALIASES: Record<string, string> = {
   CLICK_ELEMENT: 'CLICK',
   CLICK_BUTTON: 'CLICK',
   CLICK_LINK: 'CLICK',
+  CLICK_XY: 'CLICK',
+  TYPE_AT: 'TYPE',
   INPUT: 'TYPE_AND_SUBMIT',
   TYPE_TEXT: 'TYPE_AND_SUBMIT',
   ENTER_TEXT: 'TYPE_AND_SUBMIT',
@@ -347,6 +360,7 @@ const ACTION_ALIASES: Record<string, string> = {
   OPEN: 'NAVIGATE',
   SCROLL_DOWN: 'SCROLL',
   SCROLL_UP: 'SCROLL',
+  SCROLL_TO: 'SCROLL',
 };
 
 /**
@@ -516,6 +530,20 @@ function normalizeStep(step: Record<string, unknown>): Record<string, unknown> {
   }
   if ('target' in normalizedStep && normalizedStep.target === null) {
     delete normalizedStep.target;
+  }
+  if ('input' in normalizedStep && typeof normalizedStep.input !== 'string') {
+    const inputValue = normalizedStep.input;
+    if (inputValue === null || inputValue === undefined) {
+      delete normalizedStep.input;
+    } else if (
+      typeof inputValue === 'number' ||
+      typeof inputValue === 'boolean' ||
+      typeof inputValue === 'bigint'
+    ) {
+      normalizedStep.input = String(inputValue);
+    } else {
+      normalizedStep.input = JSON.stringify(inputValue);
+    }
   }
 
   if ('id' in normalizedStep && typeof normalizedStep.id === 'string') {

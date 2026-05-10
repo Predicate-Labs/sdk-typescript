@@ -175,6 +175,8 @@ export interface ActionRecord {
   action: string;
   /** Element description or URL */
   target: string | null;
+  /** Planner intent for this action, if provided */
+  intent?: string | null;
   /** Outcome (success, failed) */
   result: string;
   /** URL after action completed */
@@ -213,6 +215,7 @@ export interface StepOutcome {
   urlBefore?: string;
   urlAfter?: string;
   extractedData?: unknown;
+  pageContentPreview?: string;
 }
 
 // ---------------------------------------------------------------------------

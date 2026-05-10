@@ -59,6 +59,7 @@ export function buildStepwisePlannerPrompt(
 Actions:
 - NAVIGATE: Go directly to a URL when the next destination is known. Set "target" to the URL.
 - CLICK: Click an element. Set "intent" to describe the SPECIFIC element (include label, placeholder, or nearby text, e.g. "email textbox", "display name field", "Next button", NOT just "textbox" or "button"). Set "input" to EXACT text from elements list.
+- TYPE: Type text into a form field (not a search box). Set "input" to the VALUE from the goal. Set "intent" to describe the field (e.g., "email field", "name field").
 - TYPE_AND_SUBMIT: Type text into a search box and submit. Set "input" to the SEARCH QUERY from the goal (NOT the element label).
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
 - WAIT: Wait for content to appear when a follow-up verification is needed.
@@ -87,11 +88,11 @@ CRITICAL RULE FOR ADD TO CART:
 - Set "input" to "Add to Cart" (or exact button text from elements)
 
 Output ONLY valid JSON (no markdown, no \`\`\`):
-{"action":"NAVIGATE","target":"https://shop.test/search","verify":[{"predicate":"url_contains","args":["search"]}],"reasoning":"open the known search page"}
-{"action":"TYPE_AND_SUBMIT","intent":"searchbox","input":"wireless headphones","verify":[{"predicate":"url_contains","args":["search"]}],"reasoning":"search for product"}
-{"action":"CLICK","intent":"product link","input":"Sony WH-1000XM4 Wireless...","verify":[],"required":true,"heuristic_hints":[{"intent_pattern":"product_link","text_patterns":["sony wh-1000xm4"],"role_filter":["link"],"priority":8}],"reasoning":"click first product result"}
-{"action":"CLICK","intent":"add to cart button","input":"Add to Cart","verify":[],"required":true,"heuristic_hints":[{"intent_pattern":"add_to_cart","text_patterns":["add to cart","buy now"],"role_filter":["button"],"priority":10}],"reasoning":"add item to cart"}
-{"action":"DONE","intent":"completed","reasoning":"clicked add to cart - goal complete"}
+{"action":"NAVIGATE","target":"https://shop.test/search","verify":[{"predicate":"url_contains","args":["search"]}]}
+{"action":"TYPE_AND_SUBMIT","intent":"searchbox","input":"wireless headphones","verify":[{"predicate":"url_contains","args":["search"]}]}
+{"action":"CLICK","intent":"product link","input":"Sony WH-1000XM4 Wireless...","verify":[]}
+{"action":"CLICK","intent":"add to cart button","input":"Add to Cart","verify":[]}
+{"action":"DONE","intent":"completed"}
 
 RULES:
 1. For TYPE_AND_SUBMIT: "input" = search query from goal (what you want to search for)
@@ -105,7 +106,7 @@ RULES:
 9. Do NOT output <think> or any reasoning
 10. Do NOT return DONE until ALL parts of the goal are complete
 11. Never copy example URLs from these instructions. Only NAVIGATE to a URL from the user's task, the current page, or a visible element.
-12. For multi-step forms: process each field as a separate step, then CLICK the Next/Submit button as a separate step.
+12. For multi-step forms: TYPE into each field (action: TYPE) BEFORE clicking Next. Never click Next without filling required fields first.
 13. "intent" must be SPECIFIC: describe the element with its label or context (e.g., "email field", "plan dropdown", "Next button on step 2")`;
 
   // Inject extraction-specific guidance when the goal is an extraction task

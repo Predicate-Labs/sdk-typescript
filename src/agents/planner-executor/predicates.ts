@@ -10,6 +10,7 @@
  * - url_matches: Check if URL matches a regex pattern
  * - exists: Check if element with text/selector exists
  * - not_exists: Check if element does not exist
+ * - element_exists: Check if element with role and optional text/label exists
  * - element_count: Check element count within range
  * - any_of: Any of the sub-predicates passes
  * - all_of: All sub-predicates pass
@@ -249,6 +250,28 @@ export function buildPredicate(spec: PredicateSpec): Predicate {
       const minCount = typeof args[1] === 'number' ? args[1] : 0;
       const maxCount = typeof args[2] === 'number' ? args[2] : undefined;
       return elementCount(selector, minCount, maxCount);
+    }
+
+    case 'element_exists': {
+      const role = String(args[0] || '').toLowerCase();
+      const textQuery = args[1] ? String(args[1]).toLowerCase() : '';
+      return {
+        name: 'element_exists',
+        evaluate(snapshot: Snapshot): boolean {
+          const elements = snapshot.elements || [];
+          return elements.some(el => {
+            const elRole = (el.role || '').toLowerCase();
+            if (role && elRole !== role) return false;
+            if (!textQuery) return true;
+            const elText = (el.text || '').toLowerCase();
+            const elName = (el.name || '').toLowerCase();
+            const elAria = (el.ariaLabel || '').toLowerCase();
+            return (
+              elText.includes(textQuery) || elName.includes(textQuery) || elAria.includes(textQuery)
+            );
+          });
+        },
+      };
     }
 
     case 'any_of':

@@ -64,7 +64,6 @@ import {
 } from './boundary-detection';
 import { ComposableHeuristics } from './composable-heuristics';
 import { normalizeTaskCategory, TaskCategory } from './task-category';
-import { getCommonHint } from './common-hints';
 import type { ResolvedAgentProfile } from './profile-types';
 import { HeuristicHint } from './heuristic-hint';
 import {
@@ -1158,6 +1157,7 @@ export class PlannerExecutorAgent {
                       stepNum,
                       action: plannerAction.action,
                       target: this.summarizePlannerActionTarget(plannerAction),
+                      intent: plannerAction.intent || null,
                       result: 'failed',
                       urlAfter,
                     });
@@ -1210,6 +1210,7 @@ export class PlannerExecutorAgent {
             stepNum,
             action: plannerAction.action,
             target: this.summarizePlannerActionTarget(plannerAction),
+            intent: plannerAction.intent || null,
             result: finalOutcome.status === StepStatus.SUCCESS ? 'success' : 'failed',
             urlAfter,
             extractedData: extractedText || undefined,
@@ -1455,12 +1456,25 @@ export class PlannerExecutorAgent {
     const currentUrl = ctx.snapshot?.url || '';
     const stepGoal = plannerAction.intent || plannerAction.action;
 
+    if (this.isPreviouslyCompletedFormDataEntry(plannerAction, currentUrl)) {
+      return {
+        stepId: stepNum,
+        goal: stepGoal,
+        status: StepStatus.SKIPPED,
+        actionTaken: 'SKIPPED(previously_completed_form_step)',
+        verificationPassed: true,
+        usedVision: false,
+        durationMs: Date.now() - stepStart,
+        urlBefore: currentUrl,
+        urlAfter: currentUrl,
+      };
+    }
+
     if (
       this.config.preStepVerification &&
       (plannerAction.verify?.length || 0) > 0 &&
       plannerAction.action !== 'TYPE_AND_SUBMIT' &&
-      plannerAction.action !== 'TYPE' &&
-      plannerAction.action !== 'CLICK'
+      plannerAction.action !== 'TYPE'
     ) {
       const alreadySatisfied = await this.checkPreStepVerification(runtime, plannerAction);
       if (alreadySatisfied) {
@@ -1669,6 +1683,7 @@ export class PlannerExecutorAgent {
               usedVision: false,
               durationMs: Date.now() - stepStart,
               error: `Could not find requested data: ${extractQuery}`,
+              pageContentPreview: pageContent.slice(0, 500),
             };
           }
         } else {
@@ -1916,22 +1931,62 @@ export class PlannerExecutorAgent {
           }
         }
         await new Promise(r => setTimeout(r, 500));
-        const urlAfter = await runtime.getCurrentUrl();
-        const verificationPassed = await this.verifyStepOutcome(runtime, plannerAction);
+        let urlAfter = await runtime.getCurrentUrl();
+        let verificationPassed = await this.verifyStepOutcome(runtime, plannerAction);
+        let finalActionTaken =
+          isVisionTypeAction && plannerAction.input
+            ? `CLICK_XY(${vx}, ${vy}) + TYPE_AT("${plannerAction.input}")`
+            : `CLICK_XY(${vx}, ${vy})`;
+        let postNextPreview: string | undefined;
+        if (
+          !verificationPassed &&
+          plannerAction.action === 'TYPE' &&
+          (plannerAction.verify?.length || 0) > 0
+        ) {
+          const nextButtonId = this.findSubmitButton(activeCtx.snapshot?.elements || [], 0, false);
+          if (nextButtonId !== null) {
+            try {
+              await runtime.click(nextButtonId);
+              finalActionTaken = `${finalActionTaken} -> CLICK(${nextButtonId})`;
+              verificationPassed = await this.verifyStepOutcome(runtime, plannerAction);
+              urlAfter = await runtime.getCurrentUrl();
+              if (!verificationPassed) {
+                const postNextSnapshot = await runtime.snapshot({
+                  limit: this.config.snapshot.limitBase,
+                  screenshot: false,
+                  goal: plannerAction.intent || plannerAction.action,
+                });
+                if (postNextSnapshot) {
+                  verificationPassed = this.inferSameUrlWizardProgressAfterNext(
+                    plannerAction,
+                    activeCtx.snapshot,
+                    postNextSnapshot
+                  );
+                  postNextPreview = formatContext(
+                    postNextSnapshot.elements || [],
+                    this.config.snapshot.limitBase
+                  ).slice(0, 500);
+                }
+              }
+            } catch (e) {
+              if (this.config.verbose) {
+                console.log(`[VISION-TYPE-FORM-NEXT] Next click failed: ${e}`);
+              }
+            }
+          }
+        }
         return {
           stepId: stepNum,
           goal: stepGoal,
           status: verificationPassed ? StepStatus.SUCCESS : StepStatus.FAILED,
-          actionTaken:
-            isVisionTypeAction && plannerAction.input
-              ? `CLICK_XY(${vx}, ${vy}) + TYPE_AT("${plannerAction.input}")`
-              : `CLICK_XY(${vx}, ${vy})`,
+          actionTaken: finalActionTaken,
           llmResponseText: executorResp?.content,
           verificationPassed,
           usedVision: true,
           durationMs: Date.now() - stepStart,
           urlBefore: currentUrl,
           urlAfter,
+          pageContentPreview: verificationPassed ? undefined : postNextPreview,
         };
       }
 
@@ -2057,6 +2112,22 @@ export class PlannerExecutorAgent {
           (!requiresNavigation && !hasVerificationPredicates) ||
           modalHandled;
 
+        if (!verificationPassed) {
+          const postClickSnapshot = await runtime.snapshot({
+            limit: this.config.snapshot.limitBase,
+            screenshot: false,
+            goal: plannerAction.intent || plannerAction.action,
+          });
+          if (postClickSnapshot) {
+            verificationPassed = this.inferSameUrlWizardProgressAfterNavigationClick(
+              plannerAction,
+              targetElement,
+              activeCtx.snapshot,
+              postClickSnapshot
+            );
+          }
+        }
+
         if (
           verificationPassed &&
           (this.currentTaskCategory === TaskCategory.EXTRACTION || isTextExtractionTask(task))
@@ -2078,7 +2149,16 @@ export class PlannerExecutorAgent {
         let finalActionTaken = `CLICK(${elementId})`;
         let finalUrlAfter = urlAfter;
 
-        if (!verificationPassed && requiresNavigation && activeCtx.snapshot?.elements) {
+        const clickedElementWasNavigationLink =
+          targetElement &&
+          ((targetElement.role || '').toLowerCase() === 'link' ||
+            Boolean(targetElement.href && !targetElement.href.startsWith('#')));
+        if (
+          !verificationPassed &&
+          requiresNavigation &&
+          clickedElementWasNavigationLink &&
+          activeCtx.snapshot?.elements
+        ) {
           const fallbackElementId = this.findFallbackNavigationClickTarget(
             activeCtx.snapshot.elements,
             elementId,
@@ -2130,7 +2210,9 @@ export class PlannerExecutorAgent {
         const elements = activeCtx.snapshot?.elements || [];
         const inputElement = elements.find(element => element.id === elementId) || null;
         const isSearchLike = isSearchLikeTypeAndSubmit(plannerAction, inputElement);
+        const hasVerificationPredicates = (plannerAction.verify?.length || 0) > 0;
         let submissionSatisfied = false;
+        let finalActionTaken = `TYPE(${elementId}, "${text}")`;
 
         // Submit with Enter key for TYPE_AND_SUBMIT, plus planner TYPE actions that clearly target search.
         if (
@@ -2228,15 +2310,52 @@ export class PlannerExecutorAgent {
           }
         }
 
-        const verificationPassed =
+        let verificationPassed =
           submissionSatisfied || (await this.verifyStepOutcome(runtime, plannerAction));
         const urlAfter = await runtime.getCurrentUrl();
+
+        if (
+          !verificationPassed &&
+          plannerAction.action === 'TYPE' &&
+          !isSearchLike &&
+          hasVerificationPredicates
+        ) {
+          const nextButtonId = this.findSubmitButton(elements, elementId, false);
+          if (nextButtonId !== null) {
+            try {
+              await runtime.click(nextButtonId);
+              finalActionTaken = `${finalActionTaken} -> CLICK(${nextButtonId})`;
+              let advanced = await this.verifyStepOutcome(runtime, plannerAction);
+              if (!advanced) {
+                const postNextSnapshot = await runtime.snapshot({
+                  limit: this.config.snapshot.limitBase,
+                  screenshot: false,
+                  goal: plannerAction.intent || plannerAction.action,
+                });
+                if (postNextSnapshot) {
+                  advanced = this.inferSameUrlWizardProgressAfterNext(
+                    plannerAction,
+                    activeCtx.snapshot,
+                    postNextSnapshot
+                  );
+                }
+              }
+              if (advanced) {
+                verificationPassed = true;
+              }
+            } catch (e) {
+              if (this.config.verbose) {
+                console.log(`[TYPE-FORM-NEXT] Next click failed: ${e}`);
+              }
+            }
+          }
+        }
 
         return {
           stepId: stepNum,
           goal: plannerAction.intent || 'Type text',
           status: verificationPassed ? StepStatus.SUCCESS : StepStatus.FAILED,
-          actionTaken: `TYPE(${elementId}, "${text}")`,
+          actionTaken: finalActionTaken,
           llmResponseText: executorResp?.content,
           verificationPassed,
           usedVision: shouldUseVision,
@@ -2635,11 +2754,7 @@ export class PlannerExecutorAgent {
       return { action: 'TYPE', args: [elementId, plannerAction.input] };
     }
 
-    if (
-      plannerAction.action === 'TYPE' &&
-      plannerAction.input &&
-      isSearchLikeTypeAndSubmit(plannerAction, matchedElement)
-    ) {
+    if (plannerAction.action === 'TYPE' && plannerAction.input) {
       return { action: 'TYPE', args: [elementId, plannerAction.input] };
     }
 
@@ -2652,12 +2767,15 @@ export class PlannerExecutorAgent {
     task: string,
     forceVision: boolean = false
   ): Promise<{ parsed: ParsedAction; shouldUseVision: boolean; executorResp: LLMResponse | null }> {
-    const hasExplicitStepHints = (plannerAction.heuristicHints?.length || 0) > 0;
-    const hasCommonHint = Boolean(plannerAction.intent && getCommonHint(plannerAction.intent));
-    const allowHeuristicsDespiteVision =
+    const lowElementHtmlSnapshot =
       ctx.requiresVision &&
-      ctx.visionReason === 'too_few_elements' &&
-      (hasExplicitStepHints || hasCommonHint);
+      (ctx.visionReason === 'below_threshold' || ctx.visionReason === 'too_few_elements');
+    const typingAction =
+      plannerAction.action === 'TYPE' || plannerAction.action === 'TYPE_AND_SUBMIT';
+    const hasTextElements = (ctx.snapshot?.elements?.length || 0) > 0;
+    const allowHeuristicsDespiteVision =
+      (typingAction && (lowElementHtmlSnapshot || hasTextElements)) ||
+      Boolean(plannerAction.heuristicHints?.length);
     const heuristicAction =
       (!ctx.requiresVision || allowHeuristicsDespiteVision) && plannerAction.intent
         ? this.resolveHeuristicAction(plannerAction, ctx, task)
@@ -2918,6 +3036,95 @@ export class PlannerExecutorAgent {
     return plannerAction.intent || plannerAction.input || plannerAction.target || null;
   }
 
+  private isPreviouslyCompletedFormDataEntry(
+    plannerAction: StepwisePlannerResponse,
+    currentUrl: string
+  ): boolean {
+    if (!plannerAction.intent) {
+      return false;
+    }
+
+    const action = plannerAction.action;
+    if (!['TYPE', 'TYPE_AND_SUBMIT', 'CLICK'].includes(action)) {
+      return false;
+    }
+
+    const intentKey = this.normalizeCompletedFormIntent(plannerAction.intent);
+    if (!intentKey || !this.isFormDataEntryIntent(intentKey)) {
+      return false;
+    }
+
+    return this.actionHistory.some(record => {
+      if (!['success', 'skipped', 'vision_fallback'].includes(record.result)) {
+        return false;
+      }
+      const recordIntent = record.intent ? this.normalizeCompletedFormIntent(record.intent) : '';
+      if (!this.isFormDataEntryIntent(recordIntent)) {
+        return false;
+      }
+      if (!this.completedFormIntentsMatch(recordIntent, intentKey)) {
+        return false;
+      }
+      if (record.urlAfter && currentUrl) {
+        return (
+          this.normalizeNavigationUrl(record.urlAfter) === this.normalizeNavigationUrl(currentUrl)
+        );
+      }
+      return true;
+    });
+  }
+
+  private normalizeCompletedFormIntent(intent: string): string {
+    return intent
+      .toLowerCase()
+      .replace(
+        /\b(field|input|textbox|text box|radio button|checkbox|dropdown|select|button)\b/g,
+        ''
+      )
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private completedFormIntentsMatch(previousIntent: string, nextIntent: string): boolean {
+    if (!previousIntent || !nextIntent) {
+      return false;
+    }
+    if (previousIntent === nextIntent) {
+      return true;
+    }
+
+    const previousCategories = this.completedFormIntentCategories(previousIntent);
+    const nextCategories = this.completedFormIntentCategories(nextIntent);
+    return [...previousCategories].some(category => nextCategories.has(category));
+  }
+
+  private completedFormIntentCategories(intent: string): Set<string> {
+    const categories = new Set<string>();
+    if (/\bemail\b/.test(intent)) {
+      categories.add('email');
+    }
+    if (/\bdisplay\b/.test(intent) || /\bname\b/.test(intent)) {
+      categories.add('display_name');
+    }
+    if (/\bplan\b/.test(intent) || /\bpro\b/.test(intent)) {
+      categories.add('plan');
+    }
+    if (/\bterms?\b/.test(intent) || /\bagree\b/.test(intent) || /\bconsent\b/.test(intent)) {
+      categories.add('terms');
+    }
+    return categories;
+  }
+
+  private isFormDataEntryIntent(intent: string): boolean {
+    if (/\b(next|continue|submit|done|finish|back|previous)\b/.test(intent)) {
+      return false;
+    }
+
+    return /\b(email|display|name|plan|pro|terms?|agree|consent|checkbox|radio|dropdown)\b/.test(
+      intent
+    );
+  }
+
   private classifyStepFailure(
     plannerAction: StepwisePlannerResponse,
     outcome: StepOutcome,
@@ -3079,6 +3286,7 @@ export class PlannerExecutorAgent {
         stepNum: substepId,
         action: substep.action,
         target: this.summarizePlannerActionTarget(substep),
+        intent: substep.intent || null,
         result: substepOutcome.status === StepStatus.SUCCESS ? 'success' : 'failed',
         urlAfter: substepOutcome.urlAfter || (await runtime.getCurrentUrl()),
       });
@@ -3209,9 +3417,20 @@ export class PlannerExecutorAgent {
       return null;
     }
 
-    const hosts = nonExtractRecent
+    const urlsAfter = nonExtractRecent
       .filter(entry => entry.urlAfter)
-      .map(entry => this.urlHostKey(entry.urlAfter!));
+      .map(entry => entry.urlAfter!);
+
+    // Same-page interaction is not a navigation cycle. Multi-step forms,
+    // SPAs, and paginated lists all stay on the same URL while the agent
+    // makes forward progress. Only flag cycles involving actual navigation
+    // (different URLs visited repeatedly).
+    const distinctUrls = new Set(urlsAfter);
+    if (distinctUrls.size <= 1) {
+      return null;
+    }
+
+    const hosts = urlsAfter.map(url => this.urlHostKey(url));
 
     if (hosts.length < 4) {
       return null;
@@ -3417,13 +3636,35 @@ export class PlannerExecutorAgent {
         this.getTraceStepId()
       );
       try {
-        await runtime.goto(checkpoint.url);
+        const currentUrl = await runtime.getCurrentUrl();
+        const alreadyAtCheckpointUrl =
+          this.normalizeNavigationUrl(currentUrl) === this.normalizeNavigationUrl(checkpoint.url);
+        if (!alreadyAtCheckpointUrl) {
+          await runtime.goto(checkpoint.url);
+        }
         const verificationSnapshot = await runtime.snapshot({
           limit: this.config.snapshot.limitBase,
           screenshot: false,
           goal: 'recovery verification',
         });
         const recovered = verifyRecoveryCheckpoint(checkpoint, verificationSnapshot);
+        if (!recovered && alreadyAtCheckpointUrl) {
+          this.tracer?.emit(
+            'recovery',
+            {
+              step_index: this.currentStepIndex,
+              goal: 'recovery',
+              success: false,
+              details: {
+                phase: 'skipped_same_url_navigation',
+                checkpoint_url: checkpointUrl,
+              },
+            },
+            this.getTraceStepId()
+          );
+          this.recoveryState.clearRecoveryTarget();
+          return false;
+        }
         this.tracer?.emit(
           'recovery',
           {
@@ -3625,7 +3866,7 @@ export class PlannerExecutorAgent {
     // Submit-related patterns
     const submitPatterns = searchLike
       ? ['search', 'go', 'find', 'submit', 'apply', 'done', 'ok', 'send', 'enter']
-      : ['submit', 'continue', 'save', 'send', 'sign in', 'log in', 'apply', 'ok', 'done'];
+      : ['next', 'continue', 'submit', 'save', 'send', 'sign in', 'log in', 'apply', 'ok', 'done'];
 
     // Icon patterns (exact match)
     const iconPatterns = ['>', '→', '🔍', '⌕'];
@@ -3673,5 +3914,114 @@ export class PlannerExecutorAgent {
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => b.score - a.score);
     return candidates[0].id;
+  }
+
+  private inferSameUrlWizardProgressAfterNext(
+    plannerAction: StepwisePlannerResponse,
+    beforeSnapshot: Snapshot | null,
+    afterSnapshot: Snapshot
+  ): boolean {
+    if (plannerAction.action !== 'TYPE' || !plannerAction.input) {
+      return false;
+    }
+
+    const beforeElements = beforeSnapshot?.elements || [];
+    const afterElements = afterSnapshot.elements || [];
+    if (afterElements.length === 0) {
+      return false;
+    }
+
+    const beforeSignature = this.formPaneSignature(beforeElements);
+    const afterSignature = this.formPaneSignature(afterElements);
+    if (!afterSignature || beforeSignature === afterSignature) {
+      return false;
+    }
+
+    if (this.hasFormValidationError(afterElements)) {
+      return false;
+    }
+
+    const hasBack = afterElements.some(element => this.elementText(element) === 'back');
+    const hasForward = afterElements.some(element =>
+      /^(next|continue|submit|done|finish)$/i.test(this.elementText(element))
+    );
+    if (!hasBack || !hasForward) {
+      return false;
+    }
+
+    const typedValue = plannerAction.input.trim().toLowerCase();
+    const textboxes = afterElements.filter(element =>
+      ['textbox', 'searchbox', 'combobox'].includes((element.role || '').toLowerCase())
+    );
+    return (
+      textboxes.length === 0 ||
+      textboxes.some(element => {
+        const text = this.elementText(element);
+        return text.length > 0 && !text.includes(typedValue);
+      })
+    );
+  }
+
+  private inferSameUrlWizardProgressAfterNavigationClick(
+    plannerAction: StepwisePlannerResponse,
+    clickedElement: SnapshotElement | null,
+    beforeSnapshot: Snapshot | null,
+    afterSnapshot: Snapshot
+  ): boolean {
+    if (plannerAction.action !== 'CLICK') {
+      return false;
+    }
+
+    const clickText = clickedElement ? this.elementText(clickedElement) : '';
+    const plannerText = `${plannerAction.intent || ''} ${plannerAction.goal || ''}`.toLowerCase();
+    if (!/\b(next|continue)\b/.test(`${clickText} ${plannerText}`)) {
+      return false;
+    }
+
+    const beforeSignature = this.formPaneSignature(beforeSnapshot?.elements || []);
+    const afterSignature = this.formPaneSignature(afterSnapshot.elements || []);
+    if (!afterSignature || beforeSignature === afterSignature) {
+      return false;
+    }
+
+    if (this.hasFormValidationError(afterSnapshot.elements || [])) {
+      return false;
+    }
+
+    const hasBack = (afterSnapshot.elements || []).some(
+      element => this.elementText(element) === 'back'
+    );
+    const hasForwardOrSubmit = (afterSnapshot.elements || []).some(element =>
+      /^(next|continue|submit|done|finish)$/i.test(this.elementText(element))
+    );
+
+    return hasBack && hasForwardOrSubmit;
+  }
+
+  private formPaneSignature(elements: SnapshotElement[]): string {
+    return elements
+      .filter(element => {
+        const role = (element.role || '').toLowerCase();
+        return ['textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'button'].includes(role);
+      })
+      .map(element => `${(element.role || '').toLowerCase()}:${this.elementText(element)}`)
+      .filter(Boolean)
+      .join('|');
+  }
+
+  private hasFormValidationError(elements: SnapshotElement[]): boolean {
+    return elements.some(element =>
+      /\b(required|invalid|error|please enter|must enter|try again|failed)\b/i.test(
+        this.elementText(element)
+      )
+    );
+  }
+
+  private elementText(element: SnapshotElement): string {
+    return [element.text, element.name, element.ariaLabel, element.nearbyText]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .join(' ')
+      .trim()
+      .toLowerCase();
   }
 }

@@ -9,15 +9,20 @@ import {
   isSearchLikeTypeAndSubmit,
   isUrlChangeRelevantToIntent,
 } from '../../../src/agents/planner-executor/boundary-detection';
+import { normalizeReplanPatch } from '../../../src/agents/planner-executor/plan-utils';
 import type { SnapshotElement } from '../../../src/agents/planner-executor/plan-models';
 
 class ProviderStub extends LLMProvider {
   private responses: string[];
   public calls: Array<{ system?: string; user?: string; options?: any }> = [];
+  public imageCalls: Array<{ system?: string; user?: string; imageBase64: string; options?: any }> =
+    [];
+  private readonly vision: boolean;
 
-  constructor(responses: string[] = []) {
+  constructor(responses: string[] = [], options: { vision?: boolean } = {}) {
     super();
     this.responses = [...responses];
+    this.vision = options.vision ?? false;
   }
 
   get modelName(): string {
@@ -26,6 +31,10 @@ class ProviderStub extends LLMProvider {
 
   supportsJsonMode(): boolean {
     return true;
+  }
+
+  supportsVision(): boolean {
+    return this.vision;
   }
 
   async generate(
@@ -45,12 +54,32 @@ class ProviderStub extends LLMProvider {
       totalTokens: 15,
     };
   }
+
+  async generateWithImage(
+    system: string,
+    user: string,
+    imageBase64: string,
+    options: Record<string, any> = {}
+  ): Promise<LLMResponse> {
+    this.imageCalls.push({ system, user, imageBase64, options });
+    const content = this.responses.length ? this.responses.shift()! : 'NONE';
+    return {
+      content,
+      modelName: this.modelName,
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+    };
+  }
 }
 
 class RuntimeStub implements AgentRuntime {
   public currentUrl: string;
+  public gotoCalls: string[] = [];
   public clickCalls: number[] = [];
+  public coordinateClickCalls: Array<{ x: number; y: number }> = [];
   public typeCalls: Array<{ elementId: number; text: string }> = [];
+  public coordinateTypeCalls: string[] = [];
   public keyCalls: string[] = [];
 
   constructor(
@@ -74,6 +103,7 @@ class RuntimeStub implements AgentRuntime {
   }
 
   async goto(url: string): Promise<void> {
+    this.gotoCalls.push(url);
     this.currentUrl = url;
   }
 
@@ -82,9 +112,17 @@ class RuntimeStub implements AgentRuntime {
     await this.handlers.onClick?.(elementId, this);
   }
 
+  async clickCoordinate(x: number, y: number): Promise<void> {
+    this.coordinateClickCalls.push({ x, y });
+  }
+
   async type(elementId: number, text: string): Promise<void> {
     this.typeCalls.push({ elementId, text });
     await this.handlers.onType?.(elementId, text, this);
+  }
+
+  async typeCoordinate(text: string): Promise<void> {
+    this.coordinateTypeCalls.push(text);
   }
 
   async pressKey(key: string): Promise<void> {
@@ -107,11 +145,16 @@ class RuntimeStub implements AgentRuntime {
   }
 }
 
-function makeSnapshot(url: string, elements: Snapshot['elements']): Snapshot {
+function makeSnapshot(
+  url: string,
+  elements: Snapshot['elements'],
+  extra: Partial<Snapshot> = {}
+): Snapshot {
   return {
     url,
     title: 'Test Page',
     elements,
+    ...extra,
   };
 }
 
@@ -333,6 +376,549 @@ describe('PlannerExecutorAgent search submission parity', () => {
     expect(runtime.typeCalls).toEqual([{ elementId: 10, text: 'noise canceling earbuds' }]);
     expect(runtime.keyCalls).toEqual(['Enter']);
     expect(executor.calls).toHaveLength(0);
+  });
+
+  it('uses deterministic field heuristics on sparse multi-step form pages', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'TYPE',
+        intent: 'email field',
+        input: 'user@example.com',
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'email field completed' }),
+    ]);
+    const executor = new ProviderStub(['NONE']);
+    const runtime = new RuntimeStub('https://forms.test/signup', rt =>
+      makeSnapshot(rt.currentUrl, [
+        {
+          id: 20,
+          role: 'textbox',
+          ariaLabel: 'Email',
+          text: 'Email',
+          clickable: true,
+          importance: 100,
+        },
+        { id: 21, role: 'button', text: 'Next', clickable: true, importance: 90 },
+      ])
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Fill the multi-step signup form with user@example.com, then continue',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.typeCalls).toEqual([{ elementId: 20, text: 'user@example.com' }]);
+    expect(executor.calls).toHaveLength(0);
+  });
+
+  it('types a form field and clicks Next when verification expects the next step', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'TYPE',
+        intent: 'email field',
+        input: 'user@example.com',
+        verify: [{ predicate: 'element_exists', args: ['textbox', 'Display name'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'advanced to display name step' }),
+    ]);
+    const executor = new ProviderStub(['NONE']);
+    let stage: 'email' | 'displayName' = 'email';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'email'
+            ? [
+                {
+                  id: 20,
+                  role: 'textbox',
+                  ariaLabel: 'Email',
+                  text: 'Email',
+                  clickable: true,
+                  importance: 100,
+                },
+                { id: 21, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ]
+            : [
+                {
+                  id: 30,
+                  role: 'textbox',
+                  ariaLabel: 'Display name',
+                  text: 'Display name',
+                  clickable: true,
+                  importance: 100,
+                },
+              ],
+          { status: 'require_vision' }
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 21) {
+            stage = 'displayName';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Fill the multi-step signup form with user@example.com, then continue',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0].actionTaken).toBe('TYPE(20, "user@example.com") -> CLICK(21)');
+    expect(runtime.typeCalls).toEqual([{ elementId: 20, text: 'user@example.com' }]);
+    expect(runtime.clickCalls).toEqual([21]);
+    expect(executor.calls).toHaveLength(0);
+  });
+
+  it('clicks Next after vision coordinate typing when verification expects the next form step', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'TYPE',
+        intent: 'email field',
+        input: 'user@example.com',
+        verify: [{ predicate: 'element_exists', args: ['textbox', 'Display name'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'advanced to display name step' }),
+    ]);
+    const executor = new ProviderStub(['CLICK_XY(499, 337)'], { vision: true });
+    let stage: 'email' | 'displayName' = 'email';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'email'
+            ? [{ id: 21, role: 'button', text: 'Next', clickable: true, importance: 90 }]
+            : [
+                {
+                  id: 30,
+                  role: 'textbox',
+                  ariaLabel: 'Display name',
+                  text: 'Display name',
+                  clickable: true,
+                  importance: 100,
+                },
+              ],
+          { status: 'require_vision', screenshot: 'ZmFrZQ==' }
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 21) {
+            stage = 'displayName';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Fill the multi-step signup form with user@example.com, then continue',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'CLICK_XY(499, 337) + TYPE_AT("user@example.com") -> CLICK(21)'
+    );
+    expect(runtime.coordinateClickCalls).toEqual([{ x: 499, y: 337 }]);
+    expect(runtime.coordinateTypeCalls).toEqual(['user@example.com']);
+    expect(runtime.clickCalls).toEqual([21]);
+    expect(executor.imageCalls).toHaveLength(1);
+  });
+
+  it('treats a same-url wizard pane transition as success after vision typing and Next', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'TYPE',
+        intent: 'email field',
+        input: 'user@example.com',
+        verify: [{ predicate: 'element_exists', args: ['textbox', 'Display name'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'advanced to next wizard pane' }),
+    ]);
+    const executor = new ProviderStub(['CLICK_XY(499, 337)'], { vision: true });
+    let stage: 'email' | 'displayName' = 'email';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'email'
+            ? [{ id: 21, role: 'button', text: 'Next', clickable: true, importance: 90 }]
+            : [
+                { id: 30, role: 'textbox', text: 'Llama Rider', clickable: true, importance: 100 },
+                { id: 20, role: 'button', text: 'Back', clickable: true, importance: 80 },
+                { id: 21, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ],
+          { status: 'require_vision', screenshot: 'ZmFrZQ==' }
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 21) {
+            stage = 'displayName';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Fill the multi-step signup form with user@example.com, then continue',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'CLICK_XY(499, 337) + TYPE_AT("user@example.com") -> CLICK(21)'
+    );
+    expect(runtime.coordinateTypeCalls).toEqual(['user@example.com']);
+    expect(runtime.clickCalls).toEqual([21]);
+  });
+
+  it('treats a same-url Next click as progress before final Submit', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Next button on step 1',
+        verify: [{ predicate: 'element_exists', args: ['heading', 'Review'] }],
+      }),
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Submit button',
+        verify: [{ predicate: 'element_exists', args: ['status', 'Submitted'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'submitted onboarding form' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(2)', 'CLICK(6)']);
+    let stage: 'terms' | 'review' | 'submitted' = 'terms';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'terms'
+            ? [
+                {
+                  id: 1,
+                  role: 'checkbox',
+                  text: 'Agree to terms',
+                  clickable: true,
+                  importance: 100,
+                },
+                { id: 2, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ]
+            : stage === 'review'
+              ? [
+                  { id: 5, role: 'button', text: 'Back', clickable: true, importance: 80 },
+                  { id: 6, role: 'button', text: 'Submit', clickable: true, importance: 100 },
+                ]
+              : [{ id: 7, role: 'status', text: 'Submitted', importance: 100 }]
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 2) {
+            stage = 'review';
+          }
+          if (elementId === 6) {
+            stage = 'submitted';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Complete onboarding, agree to the terms, and lastly submit the multi-step form',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0]).toMatchObject({
+      status: StepStatus.SUCCESS,
+      actionTaken: 'CLICK(2)',
+      verificationPassed: true,
+    });
+    expect(result.stepOutcomes[1]).toMatchObject({
+      status: StepStatus.SUCCESS,
+      actionTaken: 'CLICK(6)',
+      verificationPassed: true,
+    });
+    expect(runtime.clickCalls).toEqual([2, 6]);
+  });
+
+  it('does not reload a same-url wizard checkpoint during recovery', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Next button on email step',
+        verify: [{ predicate: 'element_exists', args: ['textbox', 'Display name'] }],
+      }),
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'stale email field',
+        verify: [{ predicate: 'element_exists', args: ['textbox', 'Email'] }],
+      }),
+    ]);
+    const executor = new ProviderStub(['CLICK(2)', 'NONE']);
+    let stage: 'email' | 'displayName' = 'email';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'email'
+            ? [
+                { id: 1, role: 'textbox', text: 'Email', clickable: true, importance: 100 },
+                { id: 2, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ]
+            : [
+                { id: 3, role: 'textbox', text: 'Display name', clickable: true, importance: 100 },
+                { id: 4, role: 'button', text: 'Back', clickable: true, importance: 80 },
+                { id: 5, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ]
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 2) {
+            stage = 'displayName';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Complete a same-url onboarding wizard',
+    });
+
+    expect(result.stepOutcomes.length).toBeGreaterThanOrEqual(2);
+    expect(result.stepOutcomes[0].status).toBe(StepStatus.SUCCESS);
+    expect(result.stepOutcomes[1].status).toBe(StepStatus.FAILED);
+    expect(runtime.gotoCalls).toEqual([]);
+    expect(stage).toBe('displayName');
+  });
+
+  it('skips repeated completed form-field intents on later wizard panes', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'TYPE',
+        intent: 'email field',
+        input: 'user@example.com',
+        verify: [{ predicate: 'element_exists', args: ['textbox', 'Display name'] }],
+      }),
+      JSON.stringify({
+        action: 'TYPE',
+        intent: 'email field',
+        input: 'user@example.com',
+        verify: [{ predicate: 'element_exists', args: ['textbox', 'Email'] }],
+      }),
+      JSON.stringify({
+        action: 'TYPE',
+        intent: 'display name field',
+        input: 'Tony W',
+        verify: [{ predicate: 'element_exists', args: ['button', 'Next'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'continued past stale email repeat' }),
+    ]);
+    const executor = new ProviderStub(['TYPE(1, "user@example.com")', 'TYPE(3, "Tony W")']);
+    let stage: 'email' | 'displayName' = 'email';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'email'
+            ? [
+                { id: 1, role: 'textbox', text: 'Email', clickable: true, importance: 100 },
+                { id: 2, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ]
+            : [
+                { id: 3, role: 'textbox', text: 'Display name', clickable: true, importance: 100 },
+                { id: 4, role: 'button', text: 'Back', clickable: true, importance: 80 },
+                { id: 5, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ]
+        ),
+      {
+        onType: (elementId, _text) => {
+          if (elementId === 1) {
+            stage = 'displayName';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Complete a same-url onboarding wizard',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[1]).toMatchObject({
+      status: StepStatus.SKIPPED,
+      actionTaken: 'SKIPPED(previously_completed_form_step)',
+      verificationPassed: true,
+    });
+    expect(runtime.typeCalls).toEqual([
+      { elementId: 1, text: 'user@example.com' },
+      { elementId: 3, text: 'Tony W' },
+    ]);
+  });
+
+  it('skips narrower repeated plan-choice intents after the plan step succeeds', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'plan radio button',
+        verify: [{ predicate: 'element_exists', args: ['checkbox', 'Terms'] }],
+      }),
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Pro plan radio button',
+        verify: [{ predicate: 'element_exists', args: ['status', 'Plan confirmed'] }],
+      }),
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'terms checkbox',
+        verify: [{ predicate: 'element_exists', args: ['status', 'Submitted'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'plan selected and terms accepted' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(4)', 'CLICK(5)']);
+    let stage: 'plan' | 'terms' | 'submitted' = 'plan';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'plan'
+            ? [
+                { id: 4, role: 'radio', text: 'Pro', clickable: true, importance: 100 },
+                { id: 6, role: 'button', text: 'Next', clickable: true, importance: 90 },
+              ]
+            : stage === 'terms'
+              ? [
+                  { id: 5, role: 'checkbox', text: 'Terms', clickable: true, importance: 100 },
+                  { id: 7, role: 'button', text: 'Submit', clickable: true, importance: 90 },
+                ]
+              : [{ id: 8, role: 'status', text: 'Submitted', importance: 100 }]
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 4) {
+            stage = 'terms';
+          }
+          if (elementId === 5) {
+            stage = 'submitted';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Complete onboarding with the Pro plan and accept terms',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[1]).toMatchObject({
+      status: StepStatus.SKIPPED,
+      actionTaken: 'SKIPPED(previously_completed_form_step)',
+      verificationPassed: true,
+    });
+    expect(runtime.clickCalls).toEqual([4, 5]);
+  });
+
+  it('normalizes repair optional substep aliases and numeric inputs', () => {
+    expect(
+      normalizeReplanPatch({
+        replaceSteps: [
+          {
+            id: '1',
+            step: {
+              action: 'CLICK',
+              intent: 'repair plan step',
+              optionalSubsteps: [
+                { action: 'TYPE', intent: 'retry field', input: 4 },
+                { action: 'SCROLL_TO', intent: 'scroll to submit' },
+              ],
+            },
+          },
+        ],
+      })
+    ).toMatchObject({
+      replaceSteps: [
+        {
+          id: 1,
+          step: {
+            optionalSubsteps: [{ action: 'TYPE', input: '4' }, { action: 'SCROLL' }],
+          },
+        },
+      ],
+    });
   });
 
   it('treats a relevant search URL change as success even when planner verification is too strict', async () => {
