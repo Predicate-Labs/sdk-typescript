@@ -731,6 +731,73 @@ describe('PlannerExecutorAgent search submission parity', () => {
     expect(runtime.clickCalls).toEqual([2, 6]);
   });
 
+  it('does not pre-skip a same-url Next click just because the downstream Submit is visible', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Next button on step 2',
+        verify: [{ predicate: 'element_exists', args: ['button', 'Submit'] }],
+      }),
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Submit button',
+        verify: [{ predicate: 'element_exists', args: ['status', 'Submitted'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'form submitted' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(2)', 'CLICK(4)']);
+    let stage: 'plan' | 'review' | 'submitted' = 'plan';
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          stage === 'plan'
+            ? [
+                { id: 2, role: 'button', text: 'Next', clickable: true, importance: 90 },
+                { id: 3, role: 'checkbox', text: 'Terms', clickable: true, importance: 80 },
+                { id: 4, role: 'button', text: 'Submit', clickable: true, importance: 40 },
+              ]
+            : stage === 'review'
+              ? [
+                  { id: 4, role: 'button', text: 'Submit', clickable: true, importance: 100 },
+                  { id: 5, role: 'button', text: 'Back', clickable: true, importance: 80 },
+                ]
+              : [{ id: 6, role: 'status', text: 'Submitted', importance: 100 }]
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 2) {
+            stage = 'review';
+          } else if (elementId === 4) {
+            stage = 'submitted';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Complete a same-url onboarding wizard and lastly submit the form',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0]).toMatchObject({
+      status: StepStatus.SUCCESS,
+      actionTaken: 'CLICK(2)',
+      verificationPassed: true,
+    });
+    expect(runtime.clickCalls).toEqual([2, 4]);
+  });
+
   it('does not treat a Next click as successful final submission', async () => {
     const planner = new ProviderStub([
       JSON.stringify({
@@ -1020,6 +1087,70 @@ describe('PlannerExecutorAgent search submission parity', () => {
       verificationPassed: true,
     });
     expect(runtime.clickCalls).toEqual([1]);
+  });
+
+  it('does not require clicking Done after a terminal Submit succeeds', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Submit button',
+        verify: [{ predicate: 'element_exists', args: ['status', 'Submitted'] }],
+      }),
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'Done button',
+        verify: [{ predicate: 'element_exists', args: ['status', 'Done'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'form submitted' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(1)', 'CLICK(1)']);
+    let submitted = false;
+    const runtime = new RuntimeStub(
+      'https://forms.test/signup',
+      rt =>
+        makeSnapshot(
+          rt.currentUrl,
+          submitted
+            ? [
+                { id: 1, role: 'button', text: 'Done', clickable: true, importance: 100 },
+                { id: 2, role: 'button', text: 'Back', clickable: true, importance: 80 },
+              ]
+            : [
+                { id: 1, role: 'button', text: 'Submit', clickable: true, importance: 100 },
+                { id: 2, role: 'button', text: 'Back', clickable: true, importance: 80 },
+              ]
+        ),
+      {
+        onClick: elementId => {
+          if (elementId === 1) {
+            submitted = true;
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Lastly, submit the multi-step form',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes).toHaveLength(1);
+    expect(result.stepOutcomes[0]).toMatchObject({
+      status: StepStatus.SUCCESS,
+      actionTaken: 'CLICK(1)',
+      verificationPassed: true,
+    });
+    expect(runtime.clickCalls).toEqual([1]);
+    expect(planner.calls).toHaveLength(1);
   });
 
   it('treats other common final form buttons as terminal submissions', async () => {
@@ -1447,6 +1578,47 @@ describe('PlannerExecutorAgent search submission parity', () => {
       verificationPassed: true,
     });
     expect(runtime.clickCalls).toEqual([4, 5]);
+  });
+
+  it('does not pre-skip a form choice just because its next-step verification is already visible', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'pro plan radio button',
+        verify: [{ predicate: 'element_exists', args: ['checkbox', 'Terms'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'plan selected' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(4)']);
+    const runtime = new RuntimeStub('https://forms.test/signup', rt =>
+      makeSnapshot(rt.currentUrl, [
+        { id: 4, role: 'radio', text: 'Pro', clickable: true, importance: 100 },
+        { id: 5, role: 'radio', text: 'Basic', clickable: true, importance: 80 },
+        { id: 6, role: 'checkbox', text: 'Terms', clickable: true, importance: 90 },
+        { id: 7, role: 'button', text: 'Next', clickable: true, importance: 70 },
+      ])
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Choose the Pro plan',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0]).toMatchObject({
+      status: StepStatus.SUCCESS,
+      actionTaken: 'CLICK(4)',
+      verificationPassed: true,
+    });
+    expect(runtime.clickCalls).toEqual([4]);
   });
 
   it('treats clicking the intended radio option as success when verification is too strict', async () => {

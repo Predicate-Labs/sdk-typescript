@@ -1230,6 +1230,14 @@ export class PlannerExecutorAgent {
             success = true;
           }
 
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            this.isFinalFormSubmissionAction(task, plannerAction)
+          ) {
+            success = true;
+          }
+
           // Auto-complete extraction tasks: if the action was a successful EXTRACT
           // with actual data, and the overall task is an extraction task, mark as done.
           // This prevents infinite EXTRACT loops on extraction-focused tasks.
@@ -1480,7 +1488,9 @@ export class PlannerExecutorAgent {
       this.config.preStepVerification &&
       (plannerAction.verify?.length || 0) > 0 &&
       plannerAction.action !== 'TYPE_AND_SUBMIT' &&
-      plannerAction.action !== 'TYPE'
+      plannerAction.action !== 'TYPE' &&
+      !this.isFormDataEntryPlannerAction(plannerAction) &&
+      !this.isForwardNavigationPlannerAction(plannerAction)
     ) {
       const alreadySatisfied = await this.checkPreStepVerification(runtime, plannerAction);
       if (alreadySatisfied) {
@@ -3095,6 +3105,24 @@ export class PlannerExecutorAgent {
     });
   }
 
+  private isFormDataEntryPlannerAction(plannerAction: StepwisePlannerResponse): boolean {
+    const intentKey = plannerAction.intent
+      ? this.normalizeCompletedFormIntent(plannerAction.intent)
+      : '';
+    return Boolean(intentKey && this.isFormDataEntryIntent(intentKey));
+  }
+
+  private isForwardNavigationPlannerAction(plannerAction: StepwisePlannerResponse): boolean {
+    if (plannerAction.action !== 'CLICK') {
+      return false;
+    }
+
+    const actionText = `${plannerAction.intent || ''} ${plannerAction.input || ''} ${
+      plannerAction.target || ''
+    }`;
+    return /\b(next|continue)\b/i.test(actionText);
+  }
+
   private normalizeCompletedFormIntent(intent: string): string {
     return intent
       .toLowerCase()
@@ -4119,6 +4147,26 @@ export class PlannerExecutorAgent {
       /^(next|continue|submit)$/i.test(this.elementText(element))
     );
     return beforeSignature.length > 0 && !hasForwardOrTerminalControl;
+  }
+
+  private isFinalFormSubmissionAction(
+    task: string,
+    plannerAction: StepwisePlannerResponse
+  ): boolean {
+    if (plannerAction.action !== 'CLICK') {
+      return false;
+    }
+
+    const actionText = `${plannerAction.intent || ''} ${plannerAction.goal || ''} ${
+      plannerAction.input || ''
+    } ${plannerAction.target || ''}`;
+    if (!this.isTerminalSubmissionText(actionText)) {
+      return false;
+    }
+
+    return /\b(lastly|finally|final step|submit\s+(?:the\s+)?(?:multi-step\s+)?form|complete\s+(?:the\s+)?(?:form|onboarding|registration)|confirm registration|place order)\b/i.test(
+      task
+    );
   }
 
   private isForwardNavigationControlText(text: string): boolean {
