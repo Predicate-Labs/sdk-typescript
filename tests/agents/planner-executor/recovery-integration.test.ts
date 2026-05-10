@@ -64,6 +64,7 @@ class RuntimeStub implements AgentRuntime {
   }
 
   async click(): Promise<void> {
+    this.currentUrl = this.currentUrl.replace(/\/(checkout|cart)/, '/error');
     throw new Error('executor click failed');
   }
 

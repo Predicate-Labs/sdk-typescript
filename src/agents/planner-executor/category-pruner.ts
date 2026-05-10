@@ -284,6 +284,21 @@ export function detectPruningCategory(
     return PruningTaskCategory.FORM_FILLING;
   }
 
+  // Form-fill keyword detection takes priority over extraction
+  // because "Display name" or "email" in a form task are field labels, not extraction.
+  if (
+    normalizedGoal.includes('form') ||
+    normalizedGoal.includes('fill') ||
+    normalizedGoal.includes('fill out') ||
+    normalizedGoal.includes('submit') ||
+    normalizedGoal.includes('onboarding') ||
+    normalizedGoal.includes('sign up') ||
+    normalizedGoal.includes('signup') ||
+    normalizedGoal.includes('register')
+  ) {
+    return PruningTaskCategory.FORM_FILLING;
+  }
+
   // Extraction keyword detection takes priority over TRANSACTION/SHOPPING
   // because "find the title of X" or "extract Y" on an e-commerce site is
   // still an extraction task, not a shopping task.

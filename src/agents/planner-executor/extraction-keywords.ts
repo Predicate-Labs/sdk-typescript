@@ -177,12 +177,36 @@ export const TEXT_EXTRACTION_KEYWORDS: readonly string[] = [
  * @param task - The task or step description to analyse
  * @returns true if this looks like a text extraction task
  */
+const FORM_FILL_SIGNALS: readonly string[] = [
+  'form',
+  'fill',
+  'submit',
+  'onboarding',
+  'sign up',
+  'signup',
+  'register',
+  'checkbox',
+  'dropdown',
+  'radio button',
+  'next button',
+  'click the',
+  'type ',
+  'enter ',
+];
+
 export function isTextExtractionTask(task: string): boolean {
   if (!task) {
     return false;
   }
 
   const taskLower = task.toLowerCase();
+
+  // Form-fill negative signal: if the task clearly involves filling a form,
+  // it's not extraction even if it contains extraction-like keywords
+  // (e.g., "Display name", "email" are field labels, not extraction targets)
+  if (FORM_FILL_SIGNALS.some(signal => taskLower.includes(signal))) {
+    return false;
+  }
 
   // Tier 1: Strong extraction phrases (multi-word substring match)
   for (const phrase of EXTRACTION_PHRASES) {
