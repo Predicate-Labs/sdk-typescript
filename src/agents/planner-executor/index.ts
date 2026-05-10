@@ -68,6 +68,9 @@ export {
   type ParsedAction,
   type Snapshot,
   type SnapshotElement,
+  type SerializedAgentState,
+  type SerializedLoopState,
+  type SerializedRecoveryState,
 } from './plan-models';
 
 // Prompts
