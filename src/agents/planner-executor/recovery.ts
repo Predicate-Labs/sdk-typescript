@@ -328,4 +328,57 @@ export class RecoveryState {
   get attemptsUsed(): number {
     return this.recoveryAttemptsUsed;
   }
+
+  toJSON(): {
+    checkpoints: Array<{
+      url: string;
+      stepIndex: number;
+      snapshotDigest: string;
+      timestamp: string;
+      predicatesPassed: string[];
+      verificationPredicates?: PredicateSpec[];
+    }>;
+    recoveryAttemptsUsed: number;
+  } {
+    return {
+      checkpoints: this.checkpoints.map(cp => ({
+        url: cp.url,
+        stepIndex: cp.stepIndex,
+        snapshotDigest: cp.snapshotDigest,
+        timestamp: cp.timestamp.toISOString(),
+        predicatesPassed: cp.predicatesPassed,
+        verificationPredicates: cp.verificationPredicates,
+      })),
+      recoveryAttemptsUsed: this.recoveryAttemptsUsed,
+    };
+  }
+
+  static fromJSON(data: {
+    checkpoints: Array<{
+      url: string;
+      stepIndex: number;
+      snapshotDigest: string;
+      timestamp: string;
+      predicatesPassed: string[];
+      verificationPredicates?: PredicateSpec[];
+    }>;
+    recoveryAttemptsUsed: number;
+    maxRecoveryAttempts: number;
+    maxCheckpoints: number;
+  }): RecoveryState {
+    const state = new RecoveryState({
+      maxRecoveryAttempts: data.maxRecoveryAttempts,
+      maxCheckpoints: data.maxCheckpoints,
+    });
+    state.checkpoints = data.checkpoints.map(cp => ({
+      url: cp.url,
+      stepIndex: cp.stepIndex,
+      snapshotDigest: cp.snapshotDigest,
+      timestamp: new Date(cp.timestamp),
+      predicatesPassed: cp.predicatesPassed,
+      verificationPredicates: cp.verificationPredicates,
+    }));
+    state.recoveryAttemptsUsed = data.recoveryAttemptsUsed;
+    return state;
+  }
 }

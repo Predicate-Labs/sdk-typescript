@@ -35,6 +35,8 @@ import type {
   ParsedAction,
   Snapshot,
   SnapshotElement,
+  SerializedAgentState,
+  SerializedRecoveryState,
 } from './plan-models';
 import { StepStatus, ReplanPatchSchema } from './plan-models';
 import {
@@ -504,6 +506,11 @@ export interface PlannerExecutorAgentOptions {
    * This enables pause/resume without AbortSignal.
    */
   pauseGate?: () => Promise<void>;
+  /**
+   * Checkpoint callback: called after each step with the serialized agent state.
+   * Used for persisting task state to survive sidepanel context loss.
+   */
+  onStepCheckpoint?: (state: SerializedAgentState) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +564,7 @@ export class PlannerExecutorAgent {
     action?: string;
   }) => void;
   private pauseGate?: () => Promise<void>;
+  private onStepCheckpoint?: (state: SerializedAgentState) => void;
 
   // Run state
   private runId: string | null = null;
@@ -581,6 +589,7 @@ export class PlannerExecutorAgent {
     this.onStepOutcome = options.onStepOutcome;
     this.onProgress = options.onProgress;
     this.pauseGate = options.pauseGate;
+    this.onStepCheckpoint = options.onStepCheckpoint;
   }
 
   // ---------------------------------------------------------------------------
@@ -599,6 +608,62 @@ export class PlannerExecutorAgent {
    */
   resetTokenStats(): void {
     this.tokenCollector.reset();
+  }
+
+  exportRunState(loopLocals: {
+    stepOutcomes: StepOutcome[];
+    currentUrl: string;
+    success: boolean;
+    error: string | undefined;
+    fallbackUsed: boolean;
+    replansUsed: number;
+    queuedRepairSteps: StepwisePlannerResponse[];
+    repairHistory: RepairHistoryEntry[];
+  }): SerializedAgentState {
+    return {
+      runId: this.runId,
+      actionHistory: [...this.actionHistory],
+      currentStepIndex: this.currentStepIndex,
+      currentStep: this.currentStep ? { ...this.currentStep } : null,
+      currentTaskCategory: this.currentTaskCategory,
+      loopState: {
+        stepOutcomes: [...loopLocals.stepOutcomes],
+        currentUrl: loopLocals.currentUrl,
+        success: loopLocals.success,
+        error: loopLocals.error,
+        fallbackUsed: loopLocals.fallbackUsed,
+        replansUsed: loopLocals.replansUsed,
+        queuedRepairSteps: loopLocals.queuedRepairSteps.map(s => ({ ...s })),
+        repairHistory: [...loopLocals.repairHistory],
+      },
+      recoveryState: this.recoveryState ? this.serializeRecoveryState(this.recoveryState) : null,
+      tokenUsage: this.tokenCollector.summary(),
+    };
+  }
+
+  importRunState(state: SerializedAgentState): void {
+    this.runId = state.runId;
+    this.actionHistory = state.actionHistory.map(r => ({ ...r }));
+    this.currentStepIndex = state.currentStepIndex;
+    this.currentStep = state.currentStep ? { ...state.currentStep } : null;
+    this.currentTaskCategory = state.currentTaskCategory as TaskCategory | null;
+    if (state.recoveryState) {
+      this.recoveryState = this.deserializeRecoveryState(state.recoveryState);
+    }
+  }
+
+  private serializeRecoveryState(rs: RecoveryState): SerializedRecoveryState {
+    const json = rs.toJSON();
+    return {
+      checkpoints: json.checkpoints,
+      recoveryAttemptsUsed: json.recoveryAttemptsUsed,
+      maxRecoveryAttempts: rs.maxRecoveryAttempts,
+      maxCheckpoints: rs.maxCheckpoints,
+    };
+  }
+
+  private deserializeRecoveryState(data: SerializedRecoveryState): RecoveryState {
+    return RecoveryState.fromJSON(data);
   }
 
   private recordTokenUsage(role: string, resp: LLMResponse): void {
@@ -1282,6 +1347,25 @@ export class PlannerExecutorAgent {
 
         this.emitStepEnd(stepTraceId, stepNum, plannerAction, finalOutcome);
 
+        try {
+          if (this.onStepCheckpoint) {
+            this.onStepCheckpoint(
+              this.exportRunState({
+                stepOutcomes,
+                currentUrl,
+                success,
+                error,
+                fallbackUsed,
+                replansUsed,
+                queuedRepairSteps,
+                repairHistory,
+              })
+            );
+          }
+        } catch {
+          // Don't fail the run on checkpoint callback errors
+        }
+
         if (error) {
           break;
         }
@@ -1331,6 +1415,519 @@ export class PlannerExecutorAgent {
 
     return {
       runId: this.runId,
+      task,
+      success,
+      stepsCompleted: stepOutcomes.filter(o => o.status === StepStatus.SUCCESS).length,
+      stepsTotal: stepOutcomes.length,
+      replansUsed,
+      stepOutcomes,
+      totalDurationMs: Date.now() - startTime,
+      error,
+      tokenUsage: this.tokenCollector.summary(),
+      fallbackUsed,
+    };
+  }
+
+  async resumeRunStepwise(
+    runtime: AgentRuntime,
+    serializedState: SerializedAgentState,
+    task: string
+  ): Promise<RunOutcome> {
+    const startTime = Date.now();
+
+    this.importRunState(serializedState);
+
+    const ls = serializedState.loopState;
+    const stepOutcomes: StepOutcome[] = [...ls.stepOutcomes];
+    let currentUrl = ls.currentUrl;
+    let success = ls.success;
+    let error = ls.error;
+    let fallbackUsed = ls.fallbackUsed;
+    let replansUsed = ls.replansUsed;
+    const queuedRepairSteps: StepwisePlannerResponse[] =
+      ls.queuedRepairSteps as unknown as StepwisePlannerResponse[];
+    const repairHistory: RepairHistoryEntry[] = [...ls.repairHistory];
+    let tracedStepCount = stepOutcomes.length;
+
+    this.composableHeuristics = new ComposableHeuristics({
+      staticHeuristics: this.baseIntentHeuristics,
+      taskCategory: this.currentTaskCategory,
+    });
+
+    const maxSteps = this.config.stepwise.maxSteps;
+    const startStep = this.currentStepIndex + 1;
+
+    if (this.config.verbose) {
+      console.log(`[RESUME] Resuming from step ${startStep}/${maxSteps}, url=${currentUrl}`);
+    }
+
+    try {
+      const currentBrowserUrl = await runtime.getCurrentUrl();
+      if (currentUrl && currentBrowserUrl !== currentUrl) {
+        if (this.config.verbose) {
+          console.log(
+            `[RESUME] URL drift detected: expected=${currentUrl}, actual=${currentBrowserUrl}. Navigating back.`
+          );
+        }
+        await runtime.goto(currentUrl);
+      }
+      currentUrl = currentBrowserUrl;
+
+      for (let stepNum = startStep; stepNum <= maxSteps; stepNum++) {
+        this.currentStepIndex = stepNum;
+        this.composableHeuristics.clearStepHints();
+        const stepStart = Date.now();
+
+        if (this.config.verbose) {
+          console.log(`\n${'='.repeat(60)}`);
+          console.log(`[STEP ${stepNum}/${maxSteps}] (resumed)`);
+          console.log(`${'='.repeat(60)}`);
+        }
+
+        try {
+          const tokenSummary = this.tokenCollector.summary();
+          this.onProgress?.({
+            step: stepNum,
+            maxSteps,
+            totalTokens: tokenSummary.total.totalTokens,
+          });
+        } catch {
+          // Progress callback errors are non-blocking
+        }
+
+        if (this.pauseGate) {
+          await this.pauseGate();
+        }
+
+        const ctx = await this.snapshotWithEscalation(runtime, task);
+        currentUrl = ctx.snapshot?.url || currentUrl;
+        fallbackUsed = fallbackUsed || ctx.requiresVision;
+
+        if (this.config.authBoundary.enabled) {
+          const authResult = detectAuthBoundary(currentUrl, this.config.authBoundary);
+          if (
+            authResult.isAuthBoundary &&
+            this.config.authBoundary.stopOnAuth &&
+            !taskHasLoginIntent(task)
+          ) {
+            success = true;
+            error = this.config.authBoundary.authSuccessMessage;
+            break;
+          }
+        }
+
+        let plannerAction: StepwisePlannerResponse | null = null;
+        let plannerActionSource: 'planner' | 'repair' = 'planner';
+        if (queuedRepairSteps.length > 0) {
+          plannerAction = queuedRepairSteps.shift()!;
+          plannerActionSource = 'repair';
+        } else {
+          const [systemPrompt, userPrompt] = buildStepwisePlannerPrompt(
+            task,
+            currentUrl,
+            ctx.compactRepresentation,
+            this.actionHistory.slice(-this.config.stepwise.actionHistoryLimit)
+          );
+
+          let plannerResp: LLMResponse | null = null;
+          try {
+            plannerResp = await this.callPlannerWithRetry(systemPrompt, userPrompt, {
+              temperature: this.config.plannerTemperature,
+              max_tokens: this.config.plannerMaxTokens,
+            });
+            this.recordTokenUsage('planner', plannerResp);
+          } catch (plannerError) {
+            const plannerErrorMessage =
+              plannerError instanceof Error ? plannerError.message : String(plannerError);
+            const bootstrapAction = this.buildPlannerTimeoutBootstrapAction(
+              stepNum,
+              task,
+              ctx,
+              plannerErrorMessage
+            );
+            if (bootstrapAction) {
+              plannerAction = bootstrapAction;
+              plannerActionSource = 'repair';
+            } else {
+              stepOutcomes.push({
+                stepId: stepNum,
+                goal: 'Call planner LLM',
+                status: StepStatus.FAILED,
+                verificationPassed: false,
+                usedVision: false,
+                durationMs: Date.now() - stepStart,
+                error: `Planner LLM call failed: ${plannerErrorMessage}`,
+              });
+              if (this.shouldAbortOnPlannerFailure(plannerErrorMessage)) {
+                error = `Planner unavailable: ${plannerErrorMessage}`;
+                break;
+              }
+              continue;
+            }
+          }
+
+          if (!plannerActionSource || plannerActionSource === 'planner') {
+            if (!plannerResp) {
+              stepOutcomes.push({
+                stepId: stepNum,
+                goal: 'Call planner LLM',
+                status: StepStatus.FAILED,
+                verificationPassed: false,
+                usedVision: false,
+                durationMs: Date.now() - stepStart,
+                error: 'Planner response missing after planner action path',
+              });
+              continue;
+            }
+
+            if (!plannerResp.content || plannerResp.content.trim().length === 0) {
+              stepOutcomes.push({
+                stepId: stepNum,
+                goal: 'Parse planner response',
+                status: StepStatus.FAILED,
+                verificationPassed: false,
+                usedVision: false,
+                durationMs: Date.now() - stepStart,
+                error: 'Planner returned empty response',
+              });
+              continue;
+            }
+
+            try {
+              plannerAction = this.normalizePlannerAction(extractJson(plannerResp.content));
+            } catch (e) {
+              const parsed = parseAction(plannerResp.content);
+              if (parsed.action !== 'UNKNOWN') {
+                plannerAction = {
+                  action: parsed.action as StepwisePlannerResponse['action'],
+                  input: parsed.args[1] as string | undefined,
+                };
+              } else {
+                stepOutcomes.push({
+                  stepId: stepNum,
+                  goal: 'Parse planner response',
+                  status: StepStatus.FAILED,
+                  verificationPassed: false,
+                  usedVision: false,
+                  durationMs: Date.now() - stepStart,
+                  error: `Failed to parse planner response: ${e}`,
+                });
+                continue;
+              }
+            }
+          }
+        }
+
+        if (!plannerAction) {
+          stepOutcomes.push({
+            stepId: stepNum,
+            goal: 'Parse planner response',
+            status: StepStatus.FAILED,
+            verificationPassed: false,
+            usedVision: false,
+            durationMs: Date.now() - stepStart,
+            error: 'Planner action missing after planner/repair resolution',
+          });
+          continue;
+        }
+
+        plannerAction = this.promoteVisibleResultClick(task, ctx, plannerAction);
+        this.composableHeuristics.setStepHints(plannerAction.heuristicHints || []);
+        this.emitPlannerAction(stepNum, plannerAction, plannerActionSource);
+
+        if (plannerAction.action === 'DONE') {
+          stepOutcomes.push({
+            stepId: stepNum,
+            goal: 'Task completed',
+            status: StepStatus.SUCCESS,
+            actionTaken: 'DONE',
+            verificationPassed: true,
+            usedVision: false,
+            durationMs: Date.now() - stepStart,
+          });
+          success = true;
+          break;
+        }
+
+        const stepTraceId = this.getTraceStepId(stepNum)!;
+        tracedStepCount += 1;
+        this.tracer?.emitStepStart(
+          stepTraceId,
+          stepNum,
+          plannerAction.goal || plannerAction.intent || plannerAction.action,
+          0,
+          currentUrl
+        );
+        const outcome = await this.executeStepwiseAction(
+          runtime,
+          plannerAction,
+          stepNum,
+          task,
+          ctx,
+          stepStart
+        );
+        let finalOutcome = outcome;
+        stepOutcomes.push(finalOutcome);
+
+        try {
+          this.onStepOutcome?.(finalOutcome, ctx.snapshot?.elements);
+        } catch {
+          // Step outcome callback errors are non-blocking
+        }
+
+        let urlAfter = await runtime.getCurrentUrl();
+        currentUrl = urlAfter;
+        fallbackUsed = fallbackUsed || finalOutcome.usedVision;
+        let shouldContinue = false;
+        let actionHistoryRecorded = false;
+
+        if (finalOutcome.status === StepStatus.FAILED) {
+          if (this.config.authBoundary.enabled) {
+            const authResult = detectAuthBoundary(currentUrl, this.config.authBoundary);
+            if (
+              authResult.isAuthBoundary &&
+              this.config.authBoundary.stopOnAuth &&
+              !taskHasLoginIntent(task)
+            ) {
+              finalOutcome = {
+                ...finalOutcome,
+                status: StepStatus.SUCCESS,
+                verificationPassed: true,
+                error: this.config.authBoundary.authSuccessMessage,
+                urlAfter: currentUrl,
+              };
+              stepOutcomes[stepOutcomes.length - 1] = finalOutcome;
+              success = true;
+              error = this.config.authBoundary.authSuccessMessage;
+            }
+          }
+
+          if (!success) {
+            const optionalSubstepOutcomes = await this.executeOptionalSubsteps(
+              runtime,
+              plannerAction,
+              stepNum,
+              task
+            );
+            if (optionalSubstepOutcomes.length > 0) {
+              stepOutcomes.push(...optionalSubstepOutcomes);
+              fallbackUsed = fallbackUsed || optionalSubstepOutcomes.some(o => o.usedVision);
+              currentUrl = await runtime.getCurrentUrl();
+              urlAfter = currentUrl;
+
+              const substepsRecovered =
+                (plannerAction.verify?.length || 0) > 0
+                  ? await this.verifyStepOutcome(runtime, plannerAction)
+                  : optionalSubstepOutcomes.some(
+                      o =>
+                        o.status === StepStatus.SUCCESS ||
+                        o.status === StepStatus.SKIPPED ||
+                        o.status === StepStatus.VISION_FALLBACK
+                    );
+
+              if (substepsRecovered) {
+                finalOutcome = {
+                  ...finalOutcome,
+                  status: StepStatus.SUCCESS,
+                  verificationPassed: true,
+                  error: undefined,
+                  urlAfter: currentUrl,
+                };
+                stepOutcomes[stepOutcomes.length - optionalSubstepOutcomes.length - 1] =
+                  finalOutcome;
+                shouldContinue = true;
+              }
+            }
+
+            if (!shouldContinue) {
+              if (plannerAction.required === false) {
+                shouldContinue = true;
+              } else {
+                const shouldAttemptRecovery = plannerAction.action !== 'STUCK';
+                if (shouldAttemptRecovery && (await this.attemptRecovery(runtime))) {
+                  currentUrl = await runtime.getCurrentUrl();
+                  urlAfter = currentUrl;
+                  shouldContinue = true;
+                } else if (replansUsed < this.config.retry.maxReplans) {
+                  try {
+                    this.actionHistory.push({
+                      stepNum,
+                      action: plannerAction.action,
+                      target: this.summarizePlannerActionTarget(plannerAction),
+                      intent: plannerAction.intent || null,
+                      result: 'failed',
+                      urlAfter,
+                    });
+                    actionHistoryRecorded = true;
+                    const repairSteps = await this.requestRepairSteps(
+                      task,
+                      currentUrl,
+                      plannerAction,
+                      finalOutcome,
+                      repairHistory
+                    );
+                    replansUsed += 1;
+                    repairHistory.push({
+                      attempt: replansUsed,
+                      failureCategory: this.classifyStepFailure(
+                        plannerAction,
+                        finalOutcome,
+                        currentUrl
+                      ),
+                      failedAction: `${plannerAction.action}(${this.summarizePlannerActionTarget(plannerAction) || ''})`,
+                      reason: finalOutcome.error || 'step failed',
+                    });
+                    queuedRepairSteps.push(...repairSteps);
+                    shouldContinue = true;
+                  } catch (repairError) {
+                    error = `Replan failed: ${repairError instanceof Error ? repairError.message : String(repairError)}`;
+                  }
+                } else {
+                  error = `Step ${stepNum} failed after reaching max replans (${this.config.retry.maxReplans})`;
+                }
+              }
+            }
+          }
+        }
+
+        if (!actionHistoryRecorded) {
+          const extractedText =
+            plannerAction.action === 'EXTRACT' && finalOutcome.extractedData
+              ? typeof finalOutcome.extractedData === 'object' &&
+                finalOutcome.extractedData !== null &&
+                'text' in (finalOutcome.extractedData as Record<string, unknown>)
+                ? ((finalOutcome.extractedData as Record<string, unknown>).text as string)
+                : JSON.stringify(finalOutcome.extractedData)
+              : undefined;
+
+          this.actionHistory.push({
+            stepNum,
+            action: plannerAction.action,
+            target: this.summarizePlannerActionTarget(plannerAction),
+            intent: plannerAction.intent || null,
+            result: this.actionHistoryResult(finalOutcome.status),
+            urlAfter,
+            extractedData: extractedText || undefined,
+          });
+        }
+
+        if (
+          finalOutcome.status === StepStatus.SUCCESS ||
+          finalOutcome.status === StepStatus.SKIPPED ||
+          finalOutcome.status === StepStatus.VISION_FALLBACK
+        ) {
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            (await this.isCartAdditionTerminal(runtime, task, plannerAction))
+          ) {
+            success = true;
+          }
+
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            this.isFinalFormSubmissionAction(task, plannerAction)
+          ) {
+            success = true;
+          }
+
+          const taskHasInteraction =
+            /\b(search|navigate|go to|click|add to|fill|submit|login|sign)\b/i.test(task);
+          const hasNonExtractAction = this.actionHistory.some(rec => rec.action !== 'EXTRACT');
+          if (
+            !success &&
+            plannerAction.action === 'EXTRACT' &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            finalOutcome.extractedData &&
+            isTextExtractionTask(task) &&
+            (!taskHasInteraction || hasNonExtractAction)
+          ) {
+            success = true;
+          }
+
+          if (this.recoveryState && this.config.recovery.trackSuccessfulUrls && urlAfter) {
+            this.recoveryState.recordCheckpoint({
+              url: urlAfter,
+              stepIndex: stepNum - 1,
+              snapshotDigest: this.makeSnapshotDigest(urlAfter),
+              predicatesPassed:
+                plannerAction.verify?.map(
+                  pred =>
+                    `${pred.predicate}(${(pred.args || []).map(arg => String(arg)).join(',')})`
+                ) || [],
+              verificationPredicates: plannerAction.verify || [],
+            });
+          }
+        }
+
+        this.emitStepEnd(stepTraceId, stepNum, plannerAction, finalOutcome);
+
+        try {
+          if (this.onStepCheckpoint) {
+            this.onStepCheckpoint(
+              this.exportRunState({
+                stepOutcomes,
+                currentUrl,
+                success,
+                error,
+                fallbackUsed,
+                replansUsed,
+                queuedRepairSteps,
+                repairHistory,
+              })
+            );
+          }
+        } catch {
+          // Checkpoint callback errors are non-blocking
+        }
+
+        if (error) {
+          break;
+        }
+
+        if (success) {
+          break;
+        }
+
+        if (shouldContinue) {
+          continue;
+        }
+
+        const recentFailures = stepOutcomes.slice(-3).filter(o => o.status === StepStatus.FAILED);
+        if (recentFailures.length >= 3) {
+          error = 'Too many consecutive failures';
+          break;
+        }
+
+        const repeatedCompletedFormSkip = this.detectRepeatedCompletedFormSkip(stepOutcomes);
+        if (repeatedCompletedFormSkip) {
+          error = repeatedCompletedFormSkip;
+          break;
+        }
+
+        const cycleDetected = this.detectActionCycle(this.actionHistory);
+        if (cycleDetected) {
+          error = cycleDetected;
+          break;
+        }
+      }
+
+      if (!success && !error) {
+        error = `Exceeded maximum steps (${maxSteps})`;
+      }
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+
+    const runStatus = success ? 'success' : 'failure';
+    if (this.tracer) {
+      this.tracer.setFinalStatus(runStatus);
+      this.tracer.emitRunEnd(tracedStepCount, runStatus);
+    }
+
+    return {
+      runId: this.runId ?? crypto.randomUUID(),
       task,
       success,
       stepsCompleted: stepOutcomes.filter(o => o.status === StepStatus.SUCCESS).length,

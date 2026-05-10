@@ -263,6 +263,47 @@ export interface TokenUsageSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Serialized Agent State (for persistence across sidepanel context loss)
+// ---------------------------------------------------------------------------
+
+export interface SerializedLoopState {
+  stepOutcomes: StepOutcome[];
+  currentUrl: string;
+  success: boolean;
+  error: string | undefined;
+  fallbackUsed: boolean;
+  replansUsed: number;
+  queuedRepairSteps: Array<Record<string, unknown>>;
+  repairHistory: RepairHistoryEntry[];
+}
+
+export interface SerializedRecoveryState {
+  checkpoints: Array<{
+    url: string;
+    stepIndex: number;
+    snapshotDigest: string;
+    timestamp: string;
+    predicatesPassed: string[];
+    verificationPredicates?: PredicateSpec[];
+  }>;
+  recoveryAttemptsUsed: number;
+  maxRecoveryAttempts: number;
+  currentRecoveryTarget?: string | null;
+  maxCheckpoints: number;
+}
+
+export interface SerializedAgentState {
+  runId: string | null;
+  actionHistory: ActionRecord[];
+  currentStepIndex: number;
+  currentStep: { action: string; intent?: string } | null;
+  currentTaskCategory: string | null;
+  loopState: SerializedLoopState;
+  recoveryState: SerializedRecoveryState | null;
+  tokenUsage: TokenUsageSummary | undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot Types
 // ---------------------------------------------------------------------------
 
