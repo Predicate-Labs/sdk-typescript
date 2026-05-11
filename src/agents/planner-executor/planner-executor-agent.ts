@@ -2215,6 +2215,95 @@ export class PlannerExecutorAgent {
       };
     }
 
+    if (plannerAction.action === 'FILL_FORM') {
+      const fields = plannerAction.fields || [];
+      const submitText = plannerAction.submitText || '';
+      const elements = ctx.snapshot?.elements || [];
+      const actions: string[] = [];
+      let filledCount = 0;
+
+      const inputRoles = ['textbox', 'searchbox', 'combobox', 'input', 'password'];
+
+      for (const field of fields) {
+        const label = (field.label || '').toLowerCase();
+        const value = field.value || '';
+        let matched: SnapshotElement | null = null;
+
+        for (const el of elements) {
+          const role = (el.role || '').toLowerCase();
+          if (!inputRoles.some(r => role.includes(r))) continue;
+
+          const elText = (el.text || '').toLowerCase();
+          const elName = (el.name || '').toLowerCase();
+          const elAria = (el.ariaLabel || '').toLowerCase();
+          const elNearby = (el.nearbyText || '').toLowerCase();
+          const allText = `${elText} ${elName} ${elAria} ${elNearby}`;
+
+          if (allText.includes(label) || label.includes(elText) || label.includes(elName)) {
+            matched = el;
+            break;
+          }
+        }
+
+        if (matched) {
+          await runtime.type(matched.id, value);
+          actions.push(`TYPE(${matched.id}, "${value}")`);
+          filledCount++;
+          if (this.config.verbose) {
+            console.log(
+              `[FILL_FORM] Typed "${value}" into element ${matched.id} (${matched.text || matched.role})`
+            );
+          }
+        } else if (this.config.verbose) {
+          console.log(`[FILL_FORM] No match for field label "${label}"`);
+        }
+      }
+
+      if (filledCount === 0) {
+        return {
+          stepId: stepNum,
+          goal: stepGoal,
+          status: StepStatus.FAILED,
+          actionTaken: 'FILL_FORM(0 fields matched)',
+          verificationPassed: false,
+          usedVision: false,
+          durationMs: Date.now() - stepStart,
+          urlBefore: currentUrl,
+          urlAfter: await runtime.getCurrentUrl(),
+          error: 'No form fields matched the provided labels',
+        };
+      }
+
+      let clickedSubmit = false;
+      if (submitText) {
+        const submitEl = this.findSubmitButtonByText(elements, submitText);
+        if (submitEl !== null) {
+          await runtime.click(submitEl);
+          actions.push(`CLICK(${submitEl})`);
+          clickedSubmit = true;
+          if (this.config.verbose) {
+            console.log(`[FILL_FORM] Clicked submit button element ${submitEl}`);
+          }
+        }
+      }
+
+      await new Promise(r => setTimeout(r, clickedSubmit ? 1000 : 300));
+      const verificationPassed = await this.verifyStepOutcome(runtime, plannerAction);
+      const urlAfter = await runtime.getCurrentUrl();
+
+      return {
+        stepId: stepNum,
+        goal: stepGoal,
+        status: verificationPassed || clickedSubmit ? StepStatus.SUCCESS : StepStatus.FAILED,
+        actionTaken: `FILL_FORM(${actions.join(' -> ')})`,
+        verificationPassed,
+        usedVision: false,
+        durationMs: Date.now() - stepStart,
+        urlBefore: currentUrl,
+        urlAfter,
+      };
+    }
+
     // Handle EXTRACT action — read page content and extract data via LLM
     if (plannerAction.action === 'EXTRACT') {
       const extractQuery =
@@ -3063,6 +3152,7 @@ export class PlannerExecutorAgent {
     let visionReason: string | null = null;
     let pruningCategory: string | null = null;
     let prunedNodeCount = 0;
+    let previousElementCount = -1;
 
     // Phase 1: Limit escalation loop
     while (currentLimit <= maxLimit) {
@@ -3087,10 +3177,23 @@ export class PlannerExecutorAgent {
           currentLimit
         ).length;
 
+        const elementCount = snap.elements?.length || 0;
+
+        // Early exit: widening the limit didn't discover new elements
+        if (elementCount > 0 && elementCount === previousElementCount) {
+          if (this.config.verbose) {
+            console.log(
+              `[ESCALATION] Element count unchanged (${elementCount}), stopping escalation`
+            );
+          }
+          break;
+        }
+        previousElementCount = elementCount;
+
         const visionResult = detectSnapshotFailure(snap);
         if (this.config.verbose) {
           console.log(
-            `[VISION CHECK] elements=${(snap.elements || []).length}, shouldUseVision=${visionResult.shouldUseVision}, reason=${visionResult.reason}, screenshot=${screenshotBase64 ? 'yes' : 'no'}, executor.supportsVision=${this.executor.supportsVision()}`
+            `[VISION CHECK] elements=${elementCount}, shouldUseVision=${visionResult.shouldUseVision}, reason=${visionResult.reason}, screenshot=${screenshotBase64 ? 'yes' : 'no'}, executor.supportsVision=${this.executor.supportsVision()}`
           );
         }
         if (visionResult.shouldUseVision) {
@@ -3125,7 +3228,6 @@ export class PlannerExecutorAgent {
         if (!cfg.enabled) break;
 
         // Check element count - if sufficient, no need to escalate
-        const elementCount = snap.elements?.length || 0;
         const hasEnoughContext = pruningCategory
           ? actionableContextCount >= cfg.pruningMinElements
           : elementCount >= 10;
@@ -3153,13 +3255,16 @@ export class PlannerExecutorAgent {
 
     // Phase 2: Scroll-after-escalation
     // Only trigger for CLICK actions with specific intents
+    // Skip entirely if the page has fewer elements than limitBase (nothing below the fold)
+    const pageElementCount = lastSnapshot?.elements?.length ?? 0;
     const shouldTryScroll =
       cfg.scrollAfterEscalation &&
       step !== undefined &&
       lastSnapshot !== null &&
       !requiresVision &&
       step.action === 'CLICK' &&
-      step.intent;
+      step.intent &&
+      pageElementCount >= cfg.limitBase;
 
     if (shouldTryScroll && lastSnapshot) {
       // Check if we can find the target element using intent heuristics
@@ -3528,6 +3633,10 @@ export class PlannerExecutorAgent {
         ? (step.heuristicHints as Array<Record<string, unknown>>)
         : [],
       reasoning: typeof step.reasoning === 'string' ? step.reasoning : undefined,
+      fields: Array.isArray(step.fields)
+        ? (step.fields as Array<{ label: string; value: string }>)
+        : undefined,
+      submitText: typeof step.submitText === 'string' ? step.submitText : undefined,
     };
   }
 
@@ -3657,6 +3766,10 @@ export class PlannerExecutorAgent {
   }
 
   private summarizePlannerActionTarget(plannerAction: StepwisePlannerResponse): string | null {
+    if (plannerAction.action === 'FILL_FORM') {
+      const fields = plannerAction.fields || [];
+      return fields.map(f => `${f.label}=${f.value}`).join(', ') || null;
+    }
     if (plannerAction.action === 'TYPE' || plannerAction.action === 'TYPE_AND_SUBMIT') {
       return plannerAction.input || plannerAction.intent || plannerAction.target || null;
     }
@@ -3673,7 +3786,7 @@ export class PlannerExecutorAgent {
     }
 
     const action = plannerAction.action;
-    if (!['TYPE', 'TYPE_AND_SUBMIT', 'CLICK'].includes(action)) {
+    if (!['TYPE', 'TYPE_AND_SUBMIT', 'CLICK', 'FILL_FORM'].includes(action)) {
       return false;
     }
 
@@ -3987,15 +4100,30 @@ export class PlannerExecutorAgent {
     const pollMs = Math.max(1, this.config.retry.verifyPollMs);
     const start = Date.now();
 
+    const allUrlPredicates = plannerAction.verify.every(
+      p =>
+        p.predicate === 'url_contains' ||
+        p.predicate === 'url_equals' ||
+        p.predicate === 'url_matches'
+    );
+
     while (Date.now() - start <= timeoutMs) {
       try {
-        const snap = await runtime.snapshot({
-          limit: this.config.snapshot.limitBase,
-          screenshot: false,
-          goal: plannerAction.intent || plannerAction.action,
-        });
-        if (snap && evaluatePredicates(plannerAction.verify, snap)) {
-          return true;
+        if (allUrlPredicates) {
+          const url = await runtime.getCurrentUrl();
+          const pseudoSnap: Snapshot = { url, title: '', elements: [] };
+          if (evaluatePredicates(plannerAction.verify, pseudoSnap)) {
+            return true;
+          }
+        } else {
+          const snap = await runtime.snapshot({
+            limit: this.config.snapshot.limitBase,
+            screenshot: false,
+            goal: plannerAction.intent || plannerAction.action,
+          });
+          if (snap && evaluatePredicates(plannerAction.verify, snap)) {
+            return true;
+          }
         }
       } catch {
         // Keep polling until timeout.
@@ -4611,6 +4739,26 @@ export class PlannerExecutorAgent {
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => b.score - a.score);
     return candidates[0].id;
+  }
+
+  private findSubmitButtonByText(elements: SnapshotElement[], targetText: string): number | null {
+    const lower = targetText.toLowerCase().trim();
+    for (const el of elements) {
+      const role = (el.role || '').toLowerCase();
+      if (!['button', 'link'].includes(role)) continue;
+      if (el.clickable === false) continue;
+      const text = (el.text || '').toLowerCase().trim();
+      const ariaLabel = (el.ariaLabel || '').toLowerCase().trim();
+      if (
+        text === lower ||
+        text.includes(lower) ||
+        lower.includes(text) ||
+        ariaLabel.includes(lower)
+      ) {
+        return el.id;
+      }
+    }
+    return null;
   }
 
   private inferSameUrlWizardProgressAfterNext(

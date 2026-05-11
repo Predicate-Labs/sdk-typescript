@@ -90,6 +90,7 @@ class RuntimeStub implements AgentRuntime {
   public clickCalls: number[] = [];
   public snapshotCalls = 0;
   public snapshotLimits: number[] = [];
+  public scrollByCalls = 0;
 
   constructor(
     initialUrl: string,
@@ -131,6 +132,7 @@ class RuntimeStub implements AgentRuntime {
   }
 
   async scrollBy(): Promise<boolean> {
+    this.scrollByCalls++;
     return true;
   }
 }
@@ -648,5 +650,181 @@ describe('pruning recovery', () => {
     expect(result.success).toBe(true);
     expect(runtime.clickCalls).toEqual([99]);
     expect(executor.calls.map(call => call.mode)).toEqual(['vision']);
+  });
+
+  it('stops escalation early when element count is unchanged across iterations', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'login button',
+        verify: [],
+        required: true,
+      }),
+      JSON.stringify({ action: 'DONE' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(5)']);
+    const runtime = new RuntimeStub('https://example.com/login', rt => {
+      return makeSnapshot([
+        makeElement({ id: 1, role: 'textbox', text: 'Username', importance: 900 }),
+        makeElement({ id: 2, role: 'textbox', text: 'Password', importance: 800 }),
+        makeElement({ id: 3, role: 'button', text: 'Sign In', importance: 700, clickable: true }),
+        makeElement({
+          id: 4,
+          role: 'link',
+          text: 'Forgot Password',
+          importance: 100,
+          clickable: true,
+        }),
+        makeElement({ id: 5, role: 'button', text: 'Login', importance: 950, clickable: true }),
+      ]);
+    });
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      intentHeuristics: {
+        findElementForIntent: () => null,
+        priorityOrder: () => [],
+      },
+      config: {
+        stepwise: { maxSteps: 2 },
+        snapshot: {
+          limitBase: 50,
+          limitStep: 30,
+          limitMax: 200,
+          scrollAfterEscalation: false,
+        },
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0 },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Click the login button',
+    });
+
+    expect(result.success).toBe(true);
+    // Without the early-exit fix, Phase 1 would escalate: 50, 80, 110, 140, 170, 200
+    // With the fix, each escalation call stops at limit=80 (element count unchanged from 50→80)
+    // so limits 110, 140, 170 should never appear
+    const escalationLimits = [110, 140, 170];
+    for (const limit of escalationLimits) {
+      expect(runtime.snapshotLimits).not.toContain(limit);
+    }
+  });
+
+  it('skips scroll-after-escalation when page has fewer elements than limitBase', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'submit button',
+        verify: [],
+        required: true,
+      }),
+      JSON.stringify({ action: 'DONE' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(3)']);
+    const runtime = new RuntimeStub('https://example.com/form', rt => {
+      return makeSnapshot([
+        makeElement({ id: 1, role: 'textbox', text: 'Name', importance: 900 }),
+        makeElement({ id: 2, role: 'textbox', text: 'Email', importance: 800 }),
+        makeElement({ id: 3, role: 'button', text: 'Submit', importance: 700, clickable: true }),
+      ]);
+    });
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      intentHeuristics: {
+        findElementForIntent: () => null,
+        priorityOrder: () => [],
+      },
+      config: {
+        stepwise: { maxSteps: 2 },
+        snapshot: {
+          limitBase: 50,
+          limitStep: 30,
+          limitMax: 200,
+          scrollAfterEscalation: true,
+          scrollDirections: ['down', 'up'] as const,
+          scrollMaxAttempts: 3,
+        },
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0 },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Click the submit button',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.scrollByCalls).toBe(0);
+    // Page has only 3 elements (< limitBase=50), so scroll-after-escalation is skipped entirely.
+    // Escalation also stops early since element count doesn't grow beyond the base.
+    const escalationLimits = [110, 140, 170];
+    for (const limit of escalationLimits) {
+      expect(runtime.snapshotLimits).not.toContain(limit);
+    }
+  });
+
+  it('still escalates when element count increases across iterations', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'CLICK',
+        intent: 'add to cart button',
+        verify: [],
+        required: true,
+      }),
+      JSON.stringify({ action: 'DONE' }),
+    ]);
+    const executor = new ProviderStub(['CLICK(15)']);
+    const runtime = new RuntimeStub('https://shop.test/product', rt => {
+      const latestLimit = rt.snapshotLimits[rt.snapshotLimits.length - 1] ?? 0;
+      if (latestLimit >= 80) {
+        return makeSnapshot([
+          ...Array.from({ length: 12 }, (_, i) =>
+            makeElement({ id: i + 1, role: 'text', text: `Detail ${i}`, importance: 500 })
+          ),
+          makeElement({
+            id: 15,
+            role: 'button',
+            text: 'Add to Cart',
+            importance: 900,
+            clickable: true,
+          }),
+        ]);
+      }
+      return makeSnapshot(
+        Array.from({ length: 8 }, (_, i) =>
+          makeElement({ id: i + 1, role: 'text', text: `Detail ${i}`, importance: 500 })
+        )
+      );
+    });
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      intentHeuristics: {
+        findElementForIntent: () => null,
+        priorityOrder: () => [],
+      },
+      config: {
+        stepwise: { maxSteps: 2 },
+        snapshot: {
+          limitBase: 50,
+          limitStep: 30,
+          limitMax: 200,
+          scrollAfterEscalation: false,
+        },
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0 },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Add the product to cart',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.snapshotLimits.length).toBeGreaterThanOrEqual(2);
+    expect(runtime.snapshotLimits[0]).toBe(50);
   });
 });

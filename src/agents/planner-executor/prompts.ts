@@ -59,7 +59,8 @@ export function buildStepwisePlannerPrompt(
 Actions:
 - NAVIGATE: Go directly to a URL when the next destination is known. Set "target" to the URL.
 - CLICK: Click an element. Set "intent" to describe the SPECIFIC element (include label, placeholder, or nearby text, e.g. "email textbox", "display name field", "Next button", NOT just "textbox" or "button"). Set "input" to EXACT text from elements list.
-- TYPE: Type text into a form field (not a search box). Set "input" to the VALUE from the goal. Set "intent" to describe the field (e.g., "email field", "name field").
+- FILL_FORM: Fill ALL visible form fields and submit. Use for login, signup, checkout, or any multi-field form. Set "fields" to an array of {label, value} pairs. Set "submitText" to the submit button text. Set "verify" to check navigation after submit.
+- TYPE: Type text into a SINGLE form field. Prefer FILL_FORM for forms with multiple fields.
 - TYPE_AND_SUBMIT: Type text into a search box and submit. Set "input" to the SEARCH QUERY from the goal (NOT the element label).
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
 - WAIT: Wait for content to appear when a follow-up verification is needed.
@@ -71,7 +72,15 @@ WHEN TO USE DONE:
 - "Add to Cart" task: DONE only AFTER clicking the Add to Cart button
 - "Search and click product" task: DONE only AFTER clicking a product link
 - "Search only" task: DONE after search results appear
+- "Log in" task: DONE only AFTER the page navigates away from /login
 - If goal has multiple steps, complete ALL steps before returning DONE
+
+CRITICAL RULE FOR FILL_FORM (PREFERRED for login/signup/checkout):
+- Use FILL_FORM when the goal provides values for 2+ form fields (e.g. "username: X, password: Y")
+- "fields" is an array of {label, value} where label matches the field's visible text/placeholder
+- "submitText" is the text on the submit button (e.g. "Sign in", "Log in", "Submit", "Next")
+- The system will find and fill each field by matching label to element text/role
+- This is MUCH faster than TYPE one field at a time
 
 CRITICAL RULE FOR TYPE_AND_SUBMIT:
 - "input" must be the SEARCH QUERY you want to type (e.g., "wireless headphones")
@@ -89,6 +98,8 @@ CRITICAL RULE FOR ADD TO CART:
 
 Output ONLY valid JSON (no markdown, no \`\`\`):
 {"action":"NAVIGATE","target":"https://shop.test/search","verify":[{"predicate":"url_contains","args":["search"]}]}
+{"action":"FILL_FORM","fields":[{"label":"username","value":"john@example.com"},{"label":"password","value":"secret123"}],"submitText":"Sign in","verify":[{"predicate":"url_contains","args":["dashboard"]}]}
+{"action":"FILL_FORM","fields":[{"label":"email","value":"test@test.com"},{"label":"password","value":"pass123"},{"label":"confirm password","value":"pass123"}],"submitText":"Create Account","verify":[]}
 {"action":"TYPE_AND_SUBMIT","intent":"searchbox","input":"wireless headphones","verify":[{"predicate":"url_contains","args":["search"]}]}
 {"action":"CLICK","intent":"product link","input":"Sony WH-1000XM4 Wireless...","verify":[]}
 {"action":"CLICK","intent":"add to cart button","input":"Add to Cart","verify":[]}
@@ -102,11 +113,11 @@ RULES:
 5. Include "verify" when you know a simple URL or element predicate that proves success; otherwise use []
 6. Include planner metadata when useful: "target", "required", "stop_if_true", "optional_substeps", "heuristic_hints"
 7. "heuristic_hints" entries may use snake_case fields: "intent_pattern", "text_patterns", "role_filter", "attribute_patterns", "priority"
-8. Output ONLY JSON - no <think> tags, no markdown, no prose
-9. Do NOT output <think> or any reasoning
+8. Output ONLY JSON - no 时光网 tags, no markdown, no prose
+9. Do NOT output 时光网 or any reasoning
 10. Do NOT return DONE until ALL parts of the goal are complete
 11. Never copy example URLs from these instructions. Only NAVIGATE to a URL from the user's task, the current page, or a visible element.
-12. For multi-step forms: TYPE into each field (action: TYPE) BEFORE clicking Next. Never click Next without filling required fields first.
+12. PREFER FILL_FORM for login/signup/checkout forms with 2+ fields. Do NOT use multiple TYPE actions when FILL_FORM can do it in one step.
 13. "intent" must be SPECIFIC: describe the element with its label or context (e.g., "email field", "plan dropdown", "Next button on step 2")
 14. Treat history results "success", "skipped", and "vision_fallback" as already satisfied. Do not repeat those steps; choose the next incomplete part of the goal.`;
 
@@ -329,6 +340,7 @@ export interface StepwisePlannerResponse {
     | 'CLICK'
     | 'TYPE'
     | 'TYPE_AND_SUBMIT'
+    | 'FILL_FORM'
     | 'SCROLL'
     | 'PRESS'
     | 'WAIT'
@@ -339,6 +351,8 @@ export interface StepwisePlannerResponse {
   intent?: string;
   input?: string;
   direction?: 'up' | 'down';
+  fields?: Array<{ label: string; value: string }>;
+  submitText?: string;
   verify?: Array<{ predicate: string; args: unknown[] }>;
   required?: boolean;
   stopIfTrue?: boolean;
