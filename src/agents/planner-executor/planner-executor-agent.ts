@@ -1290,6 +1290,22 @@ export class PlannerExecutorAgent {
           finalOutcome.status === StepStatus.SKIPPED ||
           finalOutcome.status === StepStatus.VISION_FALLBACK
         ) {
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            (await this.isCartAdditionTerminal(runtime, task, plannerAction))
+          ) {
+            success = true;
+          }
+
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            this.isFinalFormSubmissionAction(task, plannerAction)
+          ) {
+            success = true;
+          }
+
           const isExtractAction =
             plannerAction.action === 'EXTRACT' || plannerAction.action === 'SCROLL_AND_COUNT';
           const taskHasInteractionLocal =
