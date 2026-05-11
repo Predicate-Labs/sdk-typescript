@@ -45,6 +45,7 @@ export const ActionType = z.enum([
   'TYPE',
   'TYPE_AND_SUBMIT',
   'SCROLL',
+  'SCROLL_AND_COUNT',
   'PRESS',
   'WAIT',
   'EXTRACT',
@@ -90,7 +91,7 @@ export const PlanStepSchema = z.lazy(() =>
     id: z.number().optional().describe('Step ID (1-indexed, contiguous)'),
     goal: z.string().optional().describe('Human-readable goal for this step'),
     action: ActionType.describe(
-      'Action type: NAVIGATE, CLICK, TYPE, TYPE_AND_SUBMIT, SCROLL, PRESS, WAIT, EXTRACT, STUCK, DONE'
+      'Action type: NAVIGATE, CLICK, TYPE, TYPE_AND_SUBMIT, SCROLL, SCROLL_AND_COUNT, PRESS, WAIT, EXTRACT, STUCK, DONE'
     ),
     target: z
       .union([z.string(), z.record(z.string(), z.unknown())])

@@ -63,6 +63,7 @@ Actions:
 - TYPE: Type text into a SINGLE form field. Prefer FILL_FORM for forms with multiple fields.
 - TYPE_AND_SUBMIT: Type text into a search box and submit. Set "input" to the SEARCH QUERY from the goal (NOT the element label).
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
+- SCROLL_AND_COUNT: Scroll through the ENTIRE page and count items. Use when the task asks "how many", "number of", "count", or "total". Set "countTarget" to describe what to count (e.g., "listings", "products", "articles"). The system scrolls viewport-by-viewport, counts matching items at each position, and sums the total.
 - WAIT: Wait for content to appear when a follow-up verification is needed.
 - EXTRACT: Extract the requested information from the current page when the task is data collection.
 - STUCK: Use only when the page state is blocked and you cannot make safe forward progress.
@@ -103,6 +104,7 @@ Output ONLY valid JSON (no markdown, no \`\`\`):
 {"action":"TYPE_AND_SUBMIT","intent":"searchbox","input":"wireless headphones","verify":[{"predicate":"url_contains","args":["search"]}]}
 {"action":"CLICK","intent":"product link","input":"Sony WH-1000XM4 Wireless...","verify":[]}
 {"action":"CLICK","intent":"add to cart button","input":"Add to Cart","verify":[]}
+{"action":"SCROLL_AND_COUNT","countTarget":"product listings","goal":"Count total product listings on the page"}
 {"action":"DONE","intent":"completed"}
 
 RULES:
@@ -342,6 +344,7 @@ export interface StepwisePlannerResponse {
     | 'TYPE_AND_SUBMIT'
     | 'FILL_FORM'
     | 'SCROLL'
+    | 'SCROLL_AND_COUNT'
     | 'PRESS'
     | 'WAIT'
     | 'EXTRACT'
@@ -353,6 +356,7 @@ export interface StepwisePlannerResponse {
   direction?: 'up' | 'down';
   fields?: Array<{ label: string; value: string }>;
   submitText?: string;
+  countTarget?: string;
   verify?: Array<{ predicate: string; args: unknown[] }>;
   required?: boolean;
   stopIfTrue?: boolean;

@@ -81,6 +81,7 @@ import {
   isTextExtractionTask,
   isExtractionTask,
   buildExtractionPrompt,
+  isCountingTask,
 } from './extraction-keywords';
 
 // ---------------------------------------------------------------------------
@@ -1260,10 +1261,12 @@ export class PlannerExecutorAgent {
 
         // Record action history after any auth-boundary or optional-substep recovery.
         if (!actionHistoryRecorded) {
-          // For EXTRACT actions, include the extracted data so the planner
+          // For EXTRACT/SCROLL_AND_COUNT actions, include the extracted data so the planner
           // knows what was already extracted and can avoid repeating
+          const isExtractOrCount =
+            plannerAction.action === 'EXTRACT' || plannerAction.action === 'SCROLL_AND_COUNT';
           const extractedText =
-            plannerAction.action === 'EXTRACT' && finalOutcome.extractedData
+            isExtractOrCount && finalOutcome.extractedData
               ? typeof finalOutcome.extractedData === 'object' &&
                 finalOutcome.extractedData !== null &&
                 'text' in (finalOutcome.extractedData as Record<string, unknown>)
@@ -1303,28 +1306,26 @@ export class PlannerExecutorAgent {
             success = true;
           }
 
-          // Auto-complete extraction tasks: if the action was a successful EXTRACT
-          // with actual data, and the overall task is an extraction task, mark as done.
-          // This prevents infinite EXTRACT loops on extraction-focused tasks.
-          // Guard: auto-complete if either (a) the task is purely extraction with no
-          // navigation/search keywords, or (b) at least one non-EXTRACT action has
-          // been performed already. This avoids premature completion on hybrid tasks
-          // like "Search for X and extract Y" while still auto-completing "Extract the
-          // title of the first post" when already on the right page.
-          const taskHasInteraction =
-            /\b(search|navigate|go to|click|add to|fill|submit|login|sign)\b/i.test(task);
-          const hasNonExtractAction = this.actionHistory.some(rec => rec.action !== 'EXTRACT');
+          const isExtractAction =
+            plannerAction.action === 'EXTRACT' || plannerAction.action === 'SCROLL_AND_COUNT';
+          const taskHasInteractionLocal =
+            /\b(click|add|remove|delete|create|update|fill|submit|log\s*in|sign\s*in)\b/i.test(
+              task
+            );
+          const hasNonExtractActionLocal = this.actionHistory.some(
+            rec => rec.action !== 'EXTRACT' && rec.action !== 'SCROLL_AND_COUNT'
+          );
           if (
             !success &&
-            plannerAction.action === 'EXTRACT' &&
+            isExtractAction &&
             finalOutcome.status === StepStatus.SUCCESS &&
             finalOutcome.extractedData &&
-            isTextExtractionTask(task) &&
-            (!taskHasInteraction || hasNonExtractAction)
+            (isTextExtractionTask(task) || isCountingTask(task)) &&
+            (!taskHasInteractionLocal || hasNonExtractActionLocal)
           ) {
             if (this.config.verbose) {
               console.log(
-                `[EXTRACT] Extraction task completed successfully, transitioning to DONE`
+                `[EXTRACT] Extraction/counting task completed successfully, transitioning to DONE`
               );
             }
             success = true;
@@ -1791,8 +1792,10 @@ export class PlannerExecutorAgent {
         }
 
         if (!actionHistoryRecorded) {
+          const isExtractOrCount =
+            plannerAction.action === 'EXTRACT' || plannerAction.action === 'SCROLL_AND_COUNT';
           const extractedText =
-            plannerAction.action === 'EXTRACT' && finalOutcome.extractedData
+            isExtractOrCount && finalOutcome.extractedData
               ? typeof finalOutcome.extractedData === 'object' &&
                 finalOutcome.extractedData !== null &&
                 'text' in (finalOutcome.extractedData as Record<string, unknown>)
@@ -1834,13 +1837,17 @@ export class PlannerExecutorAgent {
 
           const taskHasInteraction =
             /\b(search|navigate|go to|click|add to|fill|submit|login|sign)\b/i.test(task);
-          const hasNonExtractAction = this.actionHistory.some(rec => rec.action !== 'EXTRACT');
+          const hasNonExtractAction = this.actionHistory.some(
+            rec => rec.action !== 'EXTRACT' && rec.action !== 'SCROLL_AND_COUNT'
+          );
+          const isRetryExtractOrCount =
+            plannerAction.action === 'EXTRACT' || plannerAction.action === 'SCROLL_AND_COUNT';
           if (
             !success &&
-            plannerAction.action === 'EXTRACT' &&
+            isRetryExtractOrCount &&
             finalOutcome.status === StepStatus.SUCCESS &&
             finalOutcome.extractedData &&
-            isTextExtractionTask(task) &&
+            (isTextExtractionTask(task) || isCountingTask(task)) &&
             (!taskHasInteraction || hasNonExtractAction)
           ) {
             success = true;
@@ -2447,6 +2454,176 @@ export class PlannerExecutorAgent {
           goal: extractQuery,
           status: StepStatus.FAILED,
           actionTaken: 'EXTRACT',
+          verificationPassed: false,
+          usedVision: false,
+          durationMs: Date.now() - stepStart,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    }
+
+    // Handle SCROLL_AND_COUNT action — scroll entire page and count items
+    if (plannerAction.action === 'SCROLL_AND_COUNT') {
+      const countTarget =
+        plannerAction.countTarget ||
+        plannerAction.goal ||
+        plannerAction.intent ||
+        plannerAction.target ||
+        'items';
+
+      if (this.config.verbose) {
+        console.log(`[ACTION] SCROLL_AND_COUNT - target: "${countTarget}"`);
+      }
+
+      try {
+        await runtime.scroll('up');
+        await new Promise(r => setTimeout(r, 500));
+
+        const viewportHeight = await runtime.getViewportHeight();
+        const scrollDelta = Math.floor(viewportHeight * 0.85);
+        let scrollsRemaining = 50;
+        let consecutiveNoChange = 0;
+
+        while (scrollsRemaining-- > 0) {
+          const beforeUrl = await runtime.getCurrentUrl();
+          void beforeUrl;
+          const scrolled = await runtime.scrollBy(scrollDelta);
+          if (!scrolled) {
+            if (this.config.verbose) {
+              console.log(`  [SCROLL_AND_COUNT] scroll returned false, stopping`);
+            }
+            break;
+          }
+          await new Promise(r => setTimeout(r, 800));
+
+          const snapshot = await runtime.snapshot({ screenshot: false, goal: countTarget });
+          const elementCount = snapshot?.elements?.length ?? 0;
+          if (elementCount === 0) {
+            consecutiveNoChange++;
+            if (consecutiveNoChange >= 3) {
+              if (this.config.verbose) {
+                console.log(`  [SCROLL_AND_COUNT] 3 consecutive empty viewports, stopping`);
+              }
+              break;
+            }
+          } else {
+            consecutiveNoChange = 0;
+          }
+        }
+
+        if (this.config.verbose) {
+          console.log(`  [SCROLL_AND_COUNT] finished scrolling, reading page content`);
+        }
+
+        const stripThinkTags = (text: string): string =>
+          text
+            .replace(/<think[\s\S]*?<\/think>/gi, '')
+            .replace(/<think[\s\S]*$/gi, '')
+            .trim();
+
+        let extractedCount: string | null = null;
+
+        const useMarkdown = runtime.readMarkdown != null;
+        if (useMarkdown && runtime.readMarkdown) {
+          const pageContent = await runtime.readMarkdown({ maxChars: 32000 });
+
+          if (pageContent) {
+            const countPrompt = `/no_think
+You are a counting assistant. Given the full page content below, count how many distinct items match the target description.
+
+TARGET: ${countTarget}
+
+PAGE CONTENT:
+${pageContent}
+
+INSTRUCTIONS:
+1. Read the content carefully
+2. Identify and count each DISTINCT item that matches "${countTarget}"
+3. Return ONLY a single integer — the total count
+4. Do NOT count the same item twice
+5. If the page displays a total count (e.g., "12,345 results" or "Showing 1-60 of 200"), use that number
+
+COUNT:`;
+
+            const countResp = await this.executor.generate(
+              'Return only a single integer. No thinking, no explanation.',
+              countPrompt,
+              { temperature: 0.0, max_tokens: 16 }
+            );
+            this.recordTokenUsage('extract', countResp);
+
+            const countText = stripThinkTags((countResp.content || '').trim());
+            const parsed = parseInt(countText, 10);
+            if (!isNaN(parsed) && parsed >= 0) {
+              extractedCount = String(parsed);
+            }
+          }
+        }
+
+        if (extractedCount === null) {
+          const snapshot = await runtime.snapshot({ screenshot: false, goal: countTarget });
+          const elements = snapshot?.elements || [];
+          const elementDescriptions = elements
+            .slice(0, 80)
+            .map(e => {
+              const parts: string[] = [];
+              if (e.role) parts.push(e.role);
+              if (e.text) parts.push(e.text.slice(0, 120));
+              return parts.join(': ');
+            })
+            .join('\n');
+
+          const countPrompt = `/no_think
+You are a counting assistant. Given the page elements, count how many match the target.
+
+TARGET: ${countTarget}
+
+ELEMENTS:
+${elementDescriptions}
+
+Return ONLY a single integer. Do not output anything else.
+
+COUNT:`;
+
+          const countResp = await this.executor.generate(
+            'Return only a single integer. No thinking, no explanation.',
+            countPrompt,
+            { temperature: 0.0, max_tokens: 16 }
+          );
+          this.recordTokenUsage('extract', countResp);
+
+          const countText = stripThinkTags((countResp.content || '').trim());
+          const parsed = parseInt(countText, 10);
+          if (!isNaN(parsed) && parsed >= 0) {
+            extractedCount = String(parsed);
+          }
+        }
+
+        if (this.config.verbose) {
+          console.log(`  [SCROLL_AND_COUNT] final count: ${extractedCount}`);
+        }
+
+        return {
+          stepId: stepNum,
+          goal: countTarget,
+          status: StepStatus.SUCCESS,
+          actionTaken: `SCROLL_AND_COUNT(${countTarget})`,
+          verificationPassed: true,
+          usedVision: false,
+          durationMs: Date.now() - stepStart,
+          urlBefore: currentUrl,
+          urlAfter: await runtime.getCurrentUrl(),
+          extractedData: {
+            text: extractedCount || '0',
+            query: `Count ${countTarget}`,
+          },
+        };
+      } catch (e) {
+        return {
+          stepId: stepNum,
+          goal: countTarget,
+          status: StepStatus.FAILED,
+          actionTaken: 'SCROLL_AND_COUNT',
           verificationPassed: false,
           usedVision: false,
           durationMs: Date.now() - stepStart,
@@ -3637,6 +3814,7 @@ export class PlannerExecutorAgent {
         ? (step.fields as Array<{ label: string; value: string }>)
         : undefined,
       submitText: typeof step.submitText === 'string' ? step.submitText : undefined,
+      countTarget: typeof step.countTarget === 'string' ? step.countTarget : undefined,
     };
   }
 

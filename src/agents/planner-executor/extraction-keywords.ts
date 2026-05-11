@@ -49,6 +49,12 @@ const AMBIGUOUS_VERBS: readonly string[] = [
   'gather',
   'return',
   'output',
+  'note',
+  'record',
+  'summarize',
+  'outline',
+  'compare',
+  'calculate',
 ];
 
 /**
@@ -59,12 +65,15 @@ const EXTRACTION_PHRASES: readonly string[] = [
   'what is',
   'what are',
   "what's",
+  'what does',
   'show me',
   'tell me',
   'find the',
   'get the',
   'read the',
   'list the',
+  'note down',
+  'write down',
   'title of',
   'price of',
   'name of',
@@ -104,6 +113,7 @@ const CONTENT_NOUNS: readonly string[] = [
   'summary',
   'excerpt',
   'price',
+  'pricing',
   'cost',
   'amount',
   'name',
@@ -140,6 +150,22 @@ const CONTENT_NOUNS: readonly string[] = [
   'product',
   'results',
   'listings',
+  'benefits',
+  'services',
+  'courses',
+  'games',
+  'guidelines',
+  'steps',
+  'tips',
+  'events',
+  'options',
+  'perks',
+  'faqs',
+  'specifications',
+  'features',
+  'formats',
+  'cities',
+  'countries',
 ];
 
 /**
@@ -342,7 +368,55 @@ Example - product price on listing page:
 Goal: "find the price of the first laptop"
 Current URL: store.com/laptops (correct page, prices visible)
 {"action":"EXTRACT","target":"price of first laptop","goal":"Extract the price of the first laptop listing","verify":[],"reasoning":"prices are visible in listing elements"}
-`;
+
+STEP 3 - COUNTING ACROSS FULL PAGE:
+If the task asks to COUNT items ("how many", "number of", "count", "total"):
+- Use SCROLL_AND_COUNT instead of EXTRACT
+- Set "countTarget" to describe what to count (e.g., "listings", "products", "articles")
+- The system will scroll through the entire page and sum up counts
+- Do NOT use EXTRACT for counting tasks — EXTRACT only sees the current viewport
+
+Example - count all listings:
+Goal: "note how many listings are available"
+Current URL: alibaba.com/search?SearchText=smartphones (correct page)
+{"action":"SCROLL_AND_COUNT","countTarget":"product listings","goal":"Count total product listings","verify":[]}
+ `;
+}
+
+// ---------------------------------------------------------------------------
+// Counting Task Detection
+// ---------------------------------------------------------------------------
+
+const COUNTING_PHRASES: readonly string[] = [
+  'how many',
+  'how much',
+  'number of',
+  'count the',
+  'count of',
+  'total number',
+  'total count',
+  'how numerous',
+];
+
+const COUNTING_VERBS: readonly string[] = ['count', 'tally', 'enumerate'];
+
+export function isCountingTask(task: string): boolean {
+  if (!task) return false;
+  const taskLower = task.toLowerCase();
+
+  if (COUNTING_PHRASES.some(phrase => taskLower.includes(phrase))) {
+    return true;
+  }
+
+  if (
+    COUNTING_VERBS.some(verb =>
+      new RegExp(`\\b${escapeRegExp(verb)}(s|ed|ing)?\\b`).test(taskLower)
+    )
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 // ---------------------------------------------------------------------------
