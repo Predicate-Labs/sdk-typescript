@@ -342,13 +342,14 @@ export function pruneSnapshotForTask(
 
   // Data-driven path: use profile policy if provided
   if (options.profilePolicy) {
-    const { elements, maxNodes } = pruneWithPolicy(
+    const { elements } = pruneWithPolicy(
       snapshot,
       options.profilePolicy,
       options.goal,
       relaxationLevel,
       options.category,
-      options.learnedFingerprints
+      options.learnedFingerprints,
+      snapshot.gatewayRanked
     );
     const actionableElementCount = selectContextElements(elements, elements.length || 1).length;
 
@@ -379,9 +380,10 @@ export function pruneSnapshotForTask(
     }
     return policy.allow(element);
   });
-  const elements = filtered
-    .sort((left, right) => scoreElement(right, options.goal) - scoreElement(left, options.goal))
-    .slice(0, policy.maxNodes);
+  const sorted = filtered.sort(
+    (left, right) => scoreElement(right, options.goal) - scoreElement(left, options.goal)
+  );
+  const elements = snapshot.gatewayRanked ? sorted : sorted.slice(0, policy.maxNodes);
   const actionableElementCount = selectContextElements(elements, elements.length || 1).length;
 
   return {

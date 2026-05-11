@@ -335,6 +335,7 @@ export interface Snapshot {
   elements: SnapshotElement[];
   screenshot?: string;
   status?: string;
+  gatewayRanked?: boolean;
 }
 
 // ---------------------------------------------------------------------------

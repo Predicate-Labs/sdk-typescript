@@ -69,9 +69,9 @@ export function pruneWithPolicy(
   goal: string,
   relaxationLevel: number,
   category: PruningTaskCategory,
-  fingerprints: LearnedTargetFingerprint[] = []
+  fingerprints: LearnedTargetFingerprint[] = [],
+  gatewayRanked = false
 ): { elements: SnapshotElement[]; maxNodes: number } {
-  // Determine max nodes based on relaxation level
   let maxNodes: number;
   if (relaxationLevel === 0) {
     maxNodes = policy.maxElements;
@@ -86,19 +86,16 @@ export function pruneWithPolicy(
   const includePatterns = policy.includeTextPatterns ?? [];
 
   const filtered = (snapshot.elements || []).filter(element => {
-    // Role filter
     if (allowedRoles.size > 0 && !allowedRoles.has(roleOf(element))) {
       return false;
     }
 
     const text = textOf(element);
 
-    // Exclude patterns
     if (excludePatterns.some(p => text.includes(p))) {
       return false;
     }
 
-    // Include patterns (if specified, at least one must match)
     if (includePatterns.length > 0) {
       if (!includePatterns.some(p => text.includes(p.toLowerCase()))) {
         return false;
@@ -108,9 +105,10 @@ export function pruneWithPolicy(
     return true;
   });
 
-  const elements = filtered
-    .sort((a, b) => scoreElement(b, goal, fingerprints) - scoreElement(a, goal, fingerprints))
-    .slice(0, maxNodes);
+  const sorted = filtered.sort(
+    (a, b) => scoreElement(b, goal, fingerprints) - scoreElement(a, goal, fingerprints)
+  );
+  const elements = gatewayRanked ? sorted : sorted.slice(0, maxNodes);
 
   return { elements, maxNodes };
 }
