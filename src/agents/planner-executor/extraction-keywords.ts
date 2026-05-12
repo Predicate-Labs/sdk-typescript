@@ -230,7 +230,13 @@ export function isTextExtractionTask(task: string): boolean {
   // Form-fill negative signal: if the task clearly involves filling a form,
   // it's not extraction even if it contains extraction-like keywords
   // (e.g., "Display name", "email" are field labels, not extraction targets)
-  if (FORM_FILL_SIGNALS.some(signal => taskLower.includes(signal))) {
+  const hasFormFillSignal = FORM_FILL_SIGNALS.some(signal => {
+    if (signal.endsWith(' ')) {
+      return taskLower.includes(signal);
+    }
+    return new RegExp(`\\b${escapeRegExp(signal)}\\b`).test(taskLower);
+  });
+  if (hasFormFillSignal) {
     return false;
   }
 
@@ -321,7 +327,10 @@ export function isExtractionTask(task: string): boolean {
     taskLower.includes('content of') ||
     taskLower.includes('headline of') ||
     taskLower.includes('rating of') ||
-    taskLower.includes('review of')
+    taskLower.includes('review of') ||
+    taskLower.includes('summarize') ||
+    taskLower.includes('note the') ||
+    taskLower.includes('list the')
   );
 }
 
@@ -332,17 +341,34 @@ export function isExtractionTask(task: string): boolean {
  * is detected as an extraction task, instructing the planner to
  * use EXTRACT instead of CLICK for data that is already visible.
  */
-export function getExtractionDomainGuidance(): string {
+export function getExtractionDomainGuidance(includeCounting = false): string {
+  const countingSection = includeCounting
+    ? `
+
+STEP 3 - COUNTING ACROSS FULL PAGE:
+If the task asks to COUNT items (e.g., "how many listings", "number of results", "count the products", "total number of entries"):
+- Use SCROLL_AND_COUNT instead of EXTRACT
+- Set "countTarget" to describe what to count (e.g., "listings", "products", "articles")
+- The system will scroll through the entire page and sum up counts
+- Do NOT use EXTRACT for counting tasks — EXTRACT only sees the current viewport
+
+Example - count all listings:
+Goal: "note how many listings are available"
+Current URL: alibaba.com/search?SearchText=smartphones (correct page)
+{"action":"SCROLL_AND_COUNT","countTarget":"product listings","goal":"Count total product listings","verify":[]}
+`
+    : '';
+
   return `
 
 IMPORTANT: Extraction Task Planning Rules
-========================================
+=======================================
 
 STEP 1 - CHECK CURRENT URL:
 Before choosing an action, compare the Current URL to the goal.
 - Does the current page contain the data requested?
 - If the goal mentions a specific section/page (e.g., "show hn", "top stories", "/show"), check if the URL matches.
-- If you are NOT on the right page, NAVIGATE to the correct URL first.
+- If you are NOT on the right page, NAVIGATE or CLICK to navigate to the correct page first.
 
 STEP 2 - EXTRACT VISIBLE DATA:
 If the data is VISIBLE in the page context:
@@ -352,7 +378,7 @@ If the data is VISIBLE in the page context:
 CRITICAL: Do NOT click on links to external sites when extracting.
 - Post/article titles often link to EXTERNAL sites
 - To extract a title that is visible, use EXTRACT directly on the current page
-- Only click if you need to navigate to a detail page (e.g., for comments)
+- Only click if you need to navigate to a detail page to access the data (e.g., nutritional info on a recipe page)
 
 Example - wrong page, need to navigate first:
 Goal: "extract the title of the first showhn post on hackernews show"
@@ -369,18 +395,12 @@ Goal: "find the price of the first laptop"
 Current URL: store.com/laptops (correct page, prices visible)
 {"action":"EXTRACT","target":"price of first laptop","goal":"Extract the price of the first laptop listing","verify":[],"reasoning":"prices are visible in listing elements"}
 
-STEP 3 - COUNTING ACROSS FULL PAGE:
-If the task asks to COUNT items ("how many", "number of", "count", "total"):
-- Use SCROLL_AND_COUNT instead of EXTRACT
-- Set "countTarget" to describe what to count (e.g., "listings", "products", "articles")
-- The system will scroll through the entire page and sum up counts
-- Do NOT use EXTRACT for counting tasks — EXTRACT only sees the current viewport
-
-Example - count all listings:
-Goal: "note how many listings are available"
-Current URL: alibaba.com/search?SearchText=smartphones (correct page)
-{"action":"SCROLL_AND_COUNT","countTarget":"product listings","goal":"Count total product listings","verify":[]}
- `;
+Example - data on a detail page, need to click first:
+Goal: "summarize the calorie count from a recipe's nutritional information"
+Current URL: allrecipes.com/search?q=cookies (search results, not a recipe page)
+{"action":"CLICK","intent":"first recipe link","input":"Best Chocolate Chip Cookies","verify":[],"reasoning":"need to navigate to recipe detail page for nutritional info"}
+${countingSection}
+`;
 }
 
 // ---------------------------------------------------------------------------
@@ -392,27 +412,111 @@ const COUNTING_PHRASES: readonly string[] = [
   'how much',
   'number of',
   'count the',
-  'count of',
+  'count all',
+  'count each',
+  'count every',
   'total number',
-  'total count',
+  'total count of',
   'how numerous',
 ];
 
-const COUNTING_VERBS: readonly string[] = ['count', 'tally', 'enumerate'];
+// NOTE: "count of" is intentionally excluded from COUNTING_PHRASES because
+// it is ambiguous: "count of items" (verb phrase) vs "word count of the
+// article" (noun compound). The "number of" phrase covers the counting
+// semantics of "count of". Bare "count" is handled by Tier 3 below.
+
+const COUNTING_VERBS: readonly string[] = ['tally', 'enumerate'];
+
+// Words that can syntactically precede "count" when it is used as a VERB
+// (imperative, infinitive, or after an auxiliary/modal). This set is finite
+// and well-defined in English grammar. Any word NOT in this set, appearing
+// immediately before "count", indicates a noun compound like "calorie count",
+// "word count", "error count" — regardless of what the modifier noun is.
+const COUNT_VERB_PRECEDERS = new Set([
+  // Infinitive marker
+  'to',
+  // Modals and auxiliaries
+  'can',
+  'could',
+  'will',
+  'would',
+  'shall',
+  'should',
+  'must',
+  'may',
+  'might',
+  'do',
+  'did',
+  'does',
+  'have',
+  'has',
+  'had',
+  // Polite / adverbial markers
+  'please',
+  'just',
+  'also',
+  'even',
+  'still',
+  'not',
+  'never',
+  'only',
+  // Conjunctions that continue an action sequence
+  'and',
+  'or',
+  'but',
+  'then',
+  // Verbs that take infinitive complements
+  'going',
+  'try',
+  'want',
+  'need',
+  'help',
+  'let',
+  'plan',
+  'attempt',
+  'aim',
+  'start',
+  'begin',
+]);
 
 export function isCountingTask(task: string): boolean {
   if (!task) return false;
   const taskLower = task.toLowerCase();
 
+  // Tier 1: Unambiguous counting phrases (substring match)
   if (COUNTING_PHRASES.some(phrase => taskLower.includes(phrase))) {
     return true;
   }
 
+  // Tier 2: Unambiguous counting verbs (word boundary match)
   if (
     COUNTING_VERBS.some(verb =>
       new RegExp(`\\b${escapeRegExp(verb)}(s|ed|ing)?\\b`).test(taskLower)
     )
   ) {
+    return true;
+  }
+
+  // Tier 3: Context-aware "count" — distinguish verb from noun compound.
+  //
+  // In English, "[noun] count" is a compound noun meaning "the count of
+  // [noun]" (e.g., "calorie count", "word count", "page count", "error
+  // count"). As a VERB, "count" appears in imperative position (start of
+  // clause) or after auxiliaries/modals/infinitive markers.
+  //
+  // Strategy: find every "count" preceded by a word. If ALL preceding words
+  // are NOT in COUNT_VERB_PRECEDERS, every occurrence is a noun compound and
+  // this is NOT a counting task. If any occurrence has no preceding word
+  // (imperative) or is preceded by a verb preceder, it IS a counting task.
+  if (/\bcount(s|ed|ing)?\b/i.test(taskLower)) {
+    const precedingMatches = [...taskLower.matchAll(/\b([a-z]+)\s+count(s|ed|ing)?\b/g)];
+    if (precedingMatches.length > 0) {
+      const allAreNounCompounds = precedingMatches.every(m => !COUNT_VERB_PRECEDERS.has(m[1]));
+      if (allAreNounCompounds) {
+        return false;
+      }
+    }
+    // "count" with no preceding word (imperative) or preceded by a verb marker
     return true;
   }
 

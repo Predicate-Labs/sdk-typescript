@@ -1320,7 +1320,9 @@ export class PlannerExecutorAgent {
             isExtractAction &&
             finalOutcome.status === StepStatus.SUCCESS &&
             finalOutcome.extractedData &&
-            (isTextExtractionTask(task) || isCountingTask(task)) &&
+            (plannerAction.action === 'SCROLL_AND_COUNT'
+              ? isCountingTask(task)
+              : isTextExtractionTask(task) || isCountingTask(task)) &&
             (!taskHasInteractionLocal || hasNonExtractActionLocal)
           ) {
             if (this.config.verbose) {
@@ -1847,7 +1849,9 @@ export class PlannerExecutorAgent {
             isRetryExtractOrCount &&
             finalOutcome.status === StepStatus.SUCCESS &&
             finalOutcome.extractedData &&
-            (isTextExtractionTask(task) || isCountingTask(task)) &&
+            (plannerAction.action === 'SCROLL_AND_COUNT'
+              ? isCountingTask(task)
+              : isTextExtractionTask(task) || isCountingTask(task)) &&
             (!taskHasInteraction || hasNonExtractAction)
           ) {
             success = true;

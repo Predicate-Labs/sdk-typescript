@@ -6,7 +6,11 @@
  */
 
 import type { ActionRecord } from './plan-models';
-import { isExtractionTask, getExtractionDomainGuidance } from './extraction-keywords';
+import {
+  isExtractionTask,
+  isCountingTask,
+  getExtractionDomainGuidance,
+} from './extraction-keywords';
 
 // ---------------------------------------------------------------------------
 // Stepwise Planner Prompt (ReAct-style)
@@ -63,7 +67,7 @@ Actions:
 - TYPE: Type text into a SINGLE form field. Prefer FILL_FORM for forms with multiple fields.
 - TYPE_AND_SUBMIT: Type text into a search box and submit. Set "input" to the SEARCH QUERY from the goal (NOT the element label).
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
-- SCROLL_AND_COUNT: Scroll through the ENTIRE page and count items. Use when the task asks "how many", "number of", "count", or "total". Set "countTarget" to describe what to count (e.g., "listings", "products", "articles"). The system scrolls viewport-by-viewport, counts matching items at each position, and sums the total.
+- SCROLL_AND_COUNT: Scroll through the ENTIRE page and count items. Use ONLY when the task asks to enumerate items (e.g., "how many listings", "number of results", "count the products"). Do NOT use when "count" is a data value to read (e.g., "calorie count", "word count" = use EXTRACT instead). Set "countTarget" to describe what to count.
 - WAIT: Wait for content to appear when a follow-up verification is needed.
 - EXTRACT: Extract the requested information from the current page when the task is data collection.
 - STUCK: Use only when the page state is blocked and you cannot make safe forward progress.
@@ -124,7 +128,9 @@ RULES:
 14. Treat history results "success", "skipped", and "vision_fallback" as already satisfied. Do not repeat those steps; choose the next incomplete part of the goal.`;
 
   // Inject extraction-specific guidance when the goal is an extraction task
-  const extractionGuidance = isExtractionTask(goal) ? getExtractionDomainGuidance() : '';
+  const extractionGuidance = isExtractionTask(goal)
+    ? getExtractionDomainGuidance(isCountingTask(goal))
+    : '';
 
   // NOTE: /no_think MUST be at the START of user message for Qwen3 models
   const user = `/no_think
