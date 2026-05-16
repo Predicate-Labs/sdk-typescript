@@ -63,9 +63,9 @@ export function buildStepwisePlannerPrompt(
 Actions:
 - NAVIGATE: Go directly to a URL when the next destination is known. Set "target" to the URL.
 - CLICK: Click an element. Set "intent" to describe the SPECIFIC element (include label, placeholder, or nearby text, e.g. "email textbox", "display name field", "Next button", NOT just "textbox" or "button"). Set "input" to EXACT text from elements list.
-- FILL_FORM: Fill ALL visible form fields and submit. Use for login, signup, checkout, or any multi-field form. Set "fields" to an array of {label, value} pairs. Set "submitText" to the submit button text. Set "verify" to check navigation after submit.
+- TYPE_AND_SUBMIT: Type text into a search/query box and submit. Set "input" to the SEARCH QUERY from the goal (NOT the element label).
 - TYPE: Type text into a SINGLE form field. Prefer FILL_FORM for forms with multiple fields.
-- TYPE_AND_SUBMIT: Type text into a search box and submit. Set "input" to the SEARCH QUERY from the goal (NOT the element label).
+- FILL_FORM: Fill structured form fields and submit. Use ONLY for login, signup, checkout, or forms where the goal provides DISTINCT values per field (e.g. "username: X, password: Y"). Set "fields" to an array of {label, value} pairs. Set "submitText" to the submit button text. Set "verify" to check navigation after submit.
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
 - SCROLL_AND_COUNT: Scroll through the ENTIRE page and count items. Use ONLY when the task asks to enumerate items (e.g., "how many listings", "number of results", "count the products"). Do NOT use when "count" is a data value to read (e.g., "calorie count", "word count" = use EXTRACT instead). Set "countTarget" to describe what to count.
 - WAIT: Wait for content to appear when a follow-up verification is needed.
@@ -80,17 +80,33 @@ WHEN TO USE DONE:
 - "Log in" task: DONE only AFTER the page navigates away from /login
 - If goal has multiple steps, complete ALL steps before returning DONE
 
-CRITICAL RULE FOR FILL_FORM (PREFERRED for login/signup/checkout):
-- Use FILL_FORM when the goal provides values for 2+ form fields (e.g. "username: X, password: Y")
+STEP ORDERING:
+- If the task mentions a specific page or URL you are NOT on yet, NAVIGATE there FIRST before doing anything else.
+- Example: task says "Use advanced search on archive.org" but you are on the homepage → NAVIGATE to the advanced search page first, then search.
+- Example: task says "Go to amazon.com and search for headphones" → NAVIGATE to amazon.com first, then TYPE_AND_SUBMIT.
+
+SEARCH vs FORM FILL:
+- Use TYPE_AND_SUBMIT (NOT FILL_FORM) when entering a single search query into a search box. "input" = the search query.
+- On search forms with multiple fields (e.g. "Any field", "Title", "Creator"), type into the FIRST/PRIMARY query field only. Other fields are AND filters — leave them empty unless the task specifies filters.
+- Do NOT put the same search text into multiple form fields. Only the main query field needs it.
+- Use FILL_FORM ONLY when the goal provides DIFFERENT values for multiple fields (e.g. "username: X, password: Y").
+
+RECOVERY WHEN SEARCH RETURNS RAW DATA:
+- If a previous EXTRACT step failed with "JSON but lacks requested fields", the search API returned incomplete data.
+- Try navigating to a modified search URL, adding the missing fields (e.g., change fl[]=identifier to also include fl[]=title&fl[]=date).
+- Or try a regular search page instead (e.g., replace advancedsearch.php with /search?query=...).
+
+CRITICAL RULE FOR FILL_FORM (ONLY for login/signup/checkout with DISTINCT field values):
+- Use FILL_FORM ONLY when the goal provides DIFFERENT values for 2+ fields (e.g. "username: X, password: Y")
 - "fields" is an array of {label, value} where label matches the field's visible text/placeholder
-- "submitText" is the text on the submit button (e.g. "Sign in", "Log in", "Submit", "Next")
+- "submitText" is the text on the submit button (e.g., "Sign in", "Log in", "Submit", "Next")
 - The system will find and fill each field by matching label to element text/role
 - This is MUCH faster than TYPE one field at a time
 
 CRITICAL RULE FOR TYPE_AND_SUBMIT:
 - "input" must be the SEARCH QUERY you want to type (e.g., "wireless headphones")
 - "input" is NOT the element label (e.g., NOT "Search Amazon")
-- ONLY use if you see a "searchbox" or "textbox" element
+- ONLY use if you see a "searchbox" or "textbox" element on the current page
 
 CRITICAL RULE FOR CLICK (after search):
 - After searching, you are on a RESULTS PAGE. Click a PRODUCT LINK to go to product details.
@@ -123,9 +139,10 @@ RULES:
 9. Do NOT output 时光网 or any reasoning
 10. Do NOT return DONE until ALL parts of the goal are complete
 11. Never copy example URLs from these instructions. Only NAVIGATE to a URL from the user's task, the current page, or a visible element.
-12. PREFER FILL_FORM for login/signup/checkout forms with 2+ fields. Do NOT use multiple TYPE actions when FILL_FORM can do it in one step.
-13. "intent" must be SPECIFIC: describe the element with its label or context (e.g., "email field", "plan dropdown", "Next button on step 2")
-14. Treat history results "success", "skipped", and "vision_fallback" as already satisfied. Do not repeat those steps; choose the next incomplete part of the goal.`;
+12. PREFER FILL_FORM for login/signup/checkout forms with 2+ DISTINCT field values. Do NOT use multiple TYPE actions when FILL_FORM can do it in one step.
+13. Do NOT use FILL_FORM for search queries. Use TYPE_AND_SUBMIT instead — search needs only ONE query field, not multiple fields.
+14. "intent" must be SPECIFIC: describe the element with its label or context (e.g., "email field", "plan dropdown", "Next button on step 2")
+15. Treat history results "success", "skipped", and "vision_fallback" as already satisfied. Do not repeat those steps; choose the next incomplete part of the goal.`;
 
   // Inject extraction-specific guidance when the goal is an extraction task
   const extractionGuidance = isExtractionTask(goal)

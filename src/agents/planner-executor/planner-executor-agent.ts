@@ -433,6 +433,9 @@ export interface AgentRuntime {
   /** Click an element by ID */
   click(elementId: number): Promise<void>;
 
+  /** Select an option on a native select/dropdown control */
+  selectOption?(elementId: number, value: string): Promise<void>;
+
   /** Click at viewport coordinates (vision fallback) */
   clickCoordinate?(x: number, y: number): Promise<void>;
 
@@ -2043,9 +2046,12 @@ export class PlannerExecutorAgent {
   }
 
   private extractSearchQueryFromTask(task: string): string | null {
-    const directPattern = /search\s+for\s+(.+?)(?:\s+on\s+|,|then|$)/i;
+    const boundary =
+      /(?:\s+on\s+|,|\s+then\b|\s+and\s+(?:output|extract|capture|return|list|show|give)\b|$)/i;
+    const directPattern = new RegExp(`search\\s+for\\s+(.+?)${boundary.source}`, 'i');
     const directMatch = task.match(directPattern);
-    const raw = directMatch?.[1] ?? task.match(/search\s+(.+?)(?:\s+on\s+|,|then|$)/i)?.[1] ?? null;
+    const fallbackPattern = new RegExp(`search\\s+(.+?)${boundary.source}`, 'i');
+    const raw = directMatch?.[1] ?? task.match(fallbackPattern)?.[1] ?? null;
     if (!raw) {
       return null;
     }
@@ -2097,6 +2103,7 @@ export class PlannerExecutorAgent {
       (plannerAction.verify?.length || 0) > 0 &&
       plannerAction.action !== 'TYPE_AND_SUBMIT' &&
       plannerAction.action !== 'TYPE' &&
+      plannerAction.action !== 'FILL_FORM' &&
       !this.isFormDataEntryPlannerAction(plannerAction) &&
       !this.isForwardNavigationPlannerAction(plannerAction)
     ) {
@@ -2129,7 +2136,9 @@ export class PlannerExecutorAgent {
         };
       }
 
-      if (this.isCopiedPlaceholderNavigation(plannerAction.target, currentUrl, task)) {
+      const navigationTarget = plannerAction.target;
+
+      if (this.isCopiedPlaceholderNavigation(navigationTarget, currentUrl, task)) {
         return {
           stepId: stepNum,
           goal: stepGoal,
@@ -2144,14 +2153,14 @@ export class PlannerExecutorAgent {
       }
 
       try {
-        await runtime.goto(plannerAction.target);
+        await runtime.goto(navigationTarget);
         const verificationPassed = await this.verifyStepOutcome(runtime, plannerAction);
         const urlAfter = await runtime.getCurrentUrl();
         return {
           stepId: stepNum,
           goal: stepGoal,
           status: verificationPassed ? StepStatus.SUCCESS : StepStatus.FAILED,
-          actionTaken: `NAVIGATE(${plannerAction.target})`,
+          actionTaken: `NAVIGATE(${navigationTarget})`,
           verificationPassed,
           usedVision: false,
           durationMs: Date.now() - stepStart,
@@ -2227,13 +2236,149 @@ export class PlannerExecutorAgent {
     }
 
     if (plannerAction.action === 'FILL_FORM') {
-      const fields = plannerAction.fields || [];
+      let fields = plannerAction.fields || [];
       const submitText = plannerAction.submitText || '';
-      const elements = ctx.snapshot?.elements || [];
+      let elements = ctx.snapshot?.elements || [];
       const actions: string[] = [];
       let filledCount = 0;
 
       const inputRoles = ['textbox', 'searchbox', 'combobox', 'input', 'password'];
+      const alreadyUsed = new Set<number>();
+
+      const uniqueValues = new Set(fields.map(f => f.value));
+      const duplicateSingleValue = fields.length > 1 && uniqueValues.size === 1;
+      const searchQueryValue = this.getFillFormPrimarySearchValue(task, fields);
+      if (searchQueryValue) {
+        const searchFilterFields = fields.filter(
+          field =>
+            this.normalizeSearchQueryText(field.value || '') !==
+            this.normalizeSearchQueryText(searchQueryValue)
+        );
+        let primarySearchInput = this.findPrimarySearchInput(elements);
+        if (!primarySearchInput) {
+          const expandedCtx = await this.snapshotWithEscalation(runtime, task, {
+            action: plannerAction.action,
+            intent: 'primary search input',
+            relaxPruning: true,
+          });
+          elements = expandedCtx.snapshot?.elements || elements;
+          primarySearchInput = this.findPrimarySearchInput(elements);
+        }
+        if (primarySearchInput) {
+          const preUrl = await runtime.getCurrentUrl();
+          await runtime.type(primarySearchInput.id, searchQueryValue);
+          actions.push(`TYPE(${primarySearchInput.id}, "${searchQueryValue}")`);
+          alreadyUsed.add(primarySearchInput.id);
+
+          const unmatchedSearchFilterFields: string[] = [];
+          for (const field of searchFilterFields) {
+            const filterControl = this.findFillFormFilterControl(elements, field, alreadyUsed);
+            if (filterControl) {
+              alreadyUsed.add(filterControl.id);
+              const filterRole = (filterControl.role || '').toLowerCase();
+              if ((filterRole === 'select' || filterRole === 'combobox') && runtime.selectOption) {
+                await runtime.selectOption(filterControl.id, field.value);
+                actions.push(`SELECT(${filterControl.id}, ${field.value})`);
+              } else {
+                await runtime.click(filterControl.id);
+                actions.push(`CLICK(${filterControl.id}, ${field.value})`);
+              }
+            } else {
+              unmatchedSearchFilterFields.push(field.label || field.value || 'unknown');
+            }
+          }
+
+          if (unmatchedSearchFilterFields.length > 0) {
+            actions.push(...unmatchedSearchFilterFields.map(label => `UNMATCHED(${label})`));
+            return {
+              stepId: stepNum,
+              goal: stepGoal,
+              status: StepStatus.FAILED,
+              actionTaken: `FILL_FORM(${actions.join(' -> ')})`,
+              verificationPassed: false,
+              usedVision: false,
+              durationMs: Date.now() - stepStart,
+              urlBefore: currentUrl,
+              urlAfter: await runtime.getCurrentUrl(),
+              error: `Search form filters were not applied: ${unmatchedSearchFilterFields.join(', ')}`,
+            };
+          }
+
+          const hasSearchFilters = searchFilterFields.length > 0;
+          let submitEl = submitText
+            ? this.findSubmitButtonByText(elements, submitText)
+            : this.findSubmitButton(elements, primarySearchInput.id, true);
+          if (submitEl === null && hasSearchFilters) {
+            const expandedSubmitCtx = await this.snapshotWithEscalation(runtime, task, {
+              action: plannerAction.action,
+              intent: submitText || 'search submit button',
+              relaxPruning: true,
+            });
+            elements = expandedSubmitCtx.snapshot?.elements || elements;
+            submitEl = submitText
+              ? this.findSubmitButtonByText(elements, submitText)
+              : this.findSubmitButton(elements, primarySearchInput.id, true);
+          }
+          if (submitEl !== null) {
+            await runtime.click(submitEl);
+            actions.push(`CLICK(${submitEl})`);
+          } else if (hasSearchFilters) {
+            return {
+              stepId: stepNum,
+              goal: stepGoal,
+              status: StepStatus.FAILED,
+              actionTaken: `FILL_FORM(${actions.join(' -> ')} -> SUBMIT_NOT_FOUND)`,
+              verificationPassed: false,
+              usedVision: false,
+              durationMs: Date.now() - stepStart,
+              urlBefore: currentUrl,
+              urlAfter: await runtime.getCurrentUrl(),
+              error: 'Search form filters were applied but no explicit submit control was found',
+            };
+          } else {
+            await runtime.pressKey('Enter');
+            actions.push('ENTER');
+          }
+
+          const changedUrl = await this.waitForUrlChange(runtime, preUrl, 5000);
+          const verificationPassed = await this.verifyStepOutcome(runtime, plannerAction);
+          const urlAfter = await runtime.getCurrentUrl();
+          return {
+            stepId: stepNum,
+            goal: stepGoal,
+            status:
+              verificationPassed || changedUrl !== null ? StepStatus.SUCCESS : StepStatus.FAILED,
+            actionTaken: `FILL_FORM(${actions.join(' -> ')})`,
+            verificationPassed,
+            usedVision: false,
+            durationMs: Date.now() - stepStart,
+            urlBefore: currentUrl,
+            urlAfter,
+          };
+        }
+
+        return {
+          stepId: stepNum,
+          goal: stepGoal,
+          status: StepStatus.FAILED,
+          actionTaken: 'FILL_FORM(primary search input not found)',
+          verificationPassed: false,
+          usedVision: false,
+          durationMs: Date.now() - stepStart,
+          urlBefore: currentUrl,
+          urlAfter: await runtime.getCurrentUrl(),
+          error: 'Search query form fill was not applied to secondary/AND fields',
+        };
+      }
+
+      if (duplicateSingleValue) {
+        if (this.config.verbose) {
+          console.log(
+            `[FILL_FORM] All ${fields.length} fields have same value "${fields[0].value}" — filling only primary field`
+          );
+        }
+        fields = [fields[0]];
+      }
 
       for (const field of fields) {
         const label = (field.label || '').toLowerCase();
@@ -2243,6 +2388,7 @@ export class PlannerExecutorAgent {
         for (const el of elements) {
           const role = (el.role || '').toLowerCase();
           if (!inputRoles.some(r => role.includes(r))) continue;
+          if (alreadyUsed.has(el.id)) continue;
 
           const elText = (el.text || '').toLowerCase();
           const elName = (el.name || '').toLowerCase();
@@ -2257,6 +2403,7 @@ export class PlannerExecutorAgent {
         }
 
         if (matched) {
+          alreadyUsed.add(matched.id);
           await runtime.type(matched.id, value);
           actions.push(`TYPE(${matched.id}, "${value}")`);
           filledCount++;
@@ -2323,6 +2470,7 @@ export class PlannerExecutorAgent {
         plannerAction.target ||
         task ||
         'Extract relevant data from the current page';
+      const extractionRequest = this.buildExtractionRequest(task, extractQuery);
 
       const stripThinkTags = (text: string): string =>
         text
@@ -2335,6 +2483,9 @@ export class PlannerExecutorAgent {
       }
 
       try {
+        const extractionUrl = currentUrl;
+        let markdownFailureOutcome: StepOutcome | null = null;
+
         const useMarkdown = runtime.readMarkdown != null;
 
         if (useMarkdown && runtime.readMarkdown) {
@@ -2342,66 +2493,115 @@ export class PlannerExecutorAgent {
           const pageContent = await runtime.readMarkdown({ maxChars: 16000 });
 
           if (!pageContent) {
-            return {
-              stepId: stepNum,
-              goal: extractQuery,
-              status: StepStatus.FAILED,
-              actionTaken: 'EXTRACT',
-              verificationPassed: false,
-              usedVision: false,
-              durationMs: Date.now() - stepStart,
-              error: 'Failed to read page content as markdown',
-            };
-          }
-
-          if (this.config.verbose) {
-            console.log(`  [ACTION] EXTRACT - got markdown (${pageContent.length} chars):`);
-            console.log(pageContent.slice(0, 2000));
-            if (pageContent.length > 2000)
-              console.log(`  ... [truncated, ${pageContent.length - 2000} more chars]`);
-          }
-
-          // Build extraction prompt and call executor LLM
-          const [extSystem, extUser] = buildExtractionPrompt(pageContent, extractQuery);
-          const extractResp = await this.executor.generate(extSystem, extUser, {
-            temperature: 0.0,
-            max_tokens: 1024,
-          });
-          this.recordTokenUsage('extract', extractResp);
-
-          const extractedText = stripThinkTags((extractResp.content || '').trim());
-          if (extractedText && extractedText !== 'NOT_FOUND') {
             if (this.config.verbose) {
-              console.log(`  [ACTION] EXTRACT ok: ${extractedText.slice(0, 160)}`);
+              console.log(`  [ACTION] EXTRACT - markdown unavailable, using snapshot context`);
             }
-            return {
-              stepId: stepNum,
-              goal: extractQuery,
-              status: StepStatus.SUCCESS,
-              actionTaken: 'EXTRACT',
-              verificationPassed: true,
-              usedVision: false,
-              durationMs: Date.now() - stepStart,
-              urlBefore: currentUrl,
-              urlAfter: currentUrl,
-              extractedData: { text: extractedText, query: extractQuery },
-            };
           } else {
-            return {
-              stepId: stepNum,
-              goal: extractQuery,
-              status: StepStatus.FAILED,
-              actionTaken: 'EXTRACT',
-              verificationPassed: false,
-              usedVision: false,
-              durationMs: Date.now() - stepStart,
-              error: `Could not find requested data: ${extractQuery}`,
-              pageContentPreview: pageContent.slice(0, 500),
-            };
+            if (this.config.verbose) {
+              console.log(`  [ACTION] EXTRACT - got markdown (${pageContent.length} chars):`);
+              console.log(pageContent.slice(0, 2000));
+              if (pageContent.length > 2000)
+                console.log(`  ... [truncated, ${pageContent.length - 2000} more chars]`);
+            }
+
+            // Build extraction prompt and call executor LLM
+            const [extSystem, extUser] = buildExtractionPrompt(pageContent, extractionRequest);
+            const extractResp = await this.executor.generate(extSystem, extUser, {
+              temperature: 0.0,
+              max_tokens: 1024,
+            });
+            this.recordTokenUsage('extract', extractResp);
+
+            let extractedText = stripThinkTags((extractResp.content || '').trim());
+            extractedText = this.applyExtractionItemLimit(extractionRequest, extractedText);
+            const isNotFound =
+              !extractedText ||
+              extractedText === 'NOT_FOUND' ||
+              extractedText.startsWith('NOT_FOUND:');
+            if (!isNotFound) {
+              if (this.config.verbose) {
+                console.log(`  [ACTION] EXTRACT ok: ${extractedText.slice(0, 160)}`);
+              }
+              return {
+                stepId: stepNum,
+                goal: extractQuery,
+                status: StepStatus.SUCCESS,
+                actionTaken: 'EXTRACT',
+                verificationPassed: true,
+                usedVision: false,
+                durationMs: Date.now() - stepStart,
+                urlBefore: currentUrl,
+                urlAfter: extractionUrl,
+                extractedData: { text: extractedText, query: extractionRequest },
+              };
+            } else {
+              const notFoundDetail = extractedText?.startsWith('NOT_FOUND:') ? extractedText : '';
+              markdownFailureOutcome = {
+                stepId: stepNum,
+                goal: extractQuery,
+                status: StepStatus.FAILED,
+                actionTaken: 'EXTRACT',
+                verificationPassed: false,
+                usedVision: false,
+                durationMs: Date.now() - stepStart,
+                error: notFoundDetail
+                  ? `Search returned JSON but lacks requested fields. ${notFoundDetail}. Try modifying the search URL to include the missing fields (e.g., add fl[]=title&fl[]=date to the URL) or navigate to a regular search page.`
+                  : `Could not find requested data: ${extractQuery}`,
+                pageContentPreview: pageContent.slice(0, 500),
+                urlBefore: currentUrl,
+                urlAfter: extractionUrl,
+              };
+            }
           }
-        } else {
+        }
+
+        {
           // Fallback: use compact snapshot context for extraction
           const pageContent = ctx.compactRepresentation;
+          const hasSnapshotElements = (ctx.snapshot?.elements || []).length > 0;
+          if (!hasSnapshotElements && ctx.screenshotBase64 && this.executor.supportsVision()) {
+            const visionUserPrompt = `/no_think
+Extract the requested data from the screenshot of the current browser page.
+
+Request:
+${extractionRequest}
+
+Return only the extracted rows. If the screenshot does not contain the requested data, return NOT_FOUND.`;
+            const visionResp = await this.executor.generateWithImage(
+              'You extract visible data from browser screenshots.',
+              visionUserPrompt,
+              ctx.screenshotBase64,
+              {
+                temperature: 0.0,
+                max_tokens: 1024,
+              }
+            );
+            this.recordTokenUsage('extract', visionResp);
+            let extractedText = stripThinkTags((visionResp.content || '').trim());
+            extractedText = this.applyExtractionItemLimit(extractionRequest, extractedText);
+            const isNotFound =
+              !extractedText ||
+              extractedText === 'NOT_FOUND' ||
+              extractedText.startsWith('NOT_FOUND:');
+            if (!isNotFound) {
+              if (this.config.verbose) {
+                console.log(`  [ACTION] EXTRACT ok (vision): ${extractedText.slice(0, 160)}`);
+              }
+              return {
+                stepId: stepNum,
+                goal: extractQuery,
+                status: StepStatus.SUCCESS,
+                actionTaken: 'EXTRACT',
+                verificationPassed: true,
+                usedVision: true,
+                durationMs: Date.now() - stepStart,
+                urlBefore: currentUrl,
+                urlAfter: extractionUrl,
+                extractedData: { text: extractedText, query: extractionRequest },
+              };
+            }
+          }
+
           if (!pageContent || pageContent.trim().length === 0) {
             return {
               stepId: stepNum,
@@ -2415,15 +2615,20 @@ export class PlannerExecutorAgent {
             };
           }
 
-          const [extSystem, extUser] = buildExtractionPrompt(pageContent, extractQuery);
+          const [extSystem, extUser] = buildExtractionPrompt(pageContent, extractionRequest);
           const extractResp = await this.executor.generate(extSystem, extUser, {
             temperature: 0.0,
             max_tokens: 1024,
           });
           this.recordTokenUsage('extract', extractResp);
 
-          const extractedText = stripThinkTags((extractResp.content || '').trim());
-          if (extractedText && extractedText !== 'NOT_FOUND') {
+          let extractedText = stripThinkTags((extractResp.content || '').trim());
+          extractedText = this.applyExtractionItemLimit(extractionRequest, extractedText);
+          const isNotFound =
+            !extractedText ||
+            extractedText === 'NOT_FOUND' ||
+            extractedText.startsWith('NOT_FOUND:');
+          if (!isNotFound) {
             if (this.config.verbose) {
               console.log(`  [ACTION] EXTRACT ok (snapshot): ${extractedText.slice(0, 160)}`);
             }
@@ -2436,20 +2641,22 @@ export class PlannerExecutorAgent {
               usedVision: false,
               durationMs: Date.now() - stepStart,
               urlBefore: currentUrl,
-              urlAfter: currentUrl,
-              extractedData: { text: extractedText, query: extractQuery },
+              urlAfter: extractionUrl,
+              extractedData: { text: extractedText, query: extractionRequest },
             };
           } else {
-            return {
-              stepId: stepNum,
-              goal: extractQuery,
-              status: StepStatus.FAILED,
-              actionTaken: 'EXTRACT',
-              verificationPassed: false,
-              usedVision: false,
-              durationMs: Date.now() - stepStart,
-              error: `Could not extract requested data: ${extractQuery}`,
-            };
+            return (
+              markdownFailureOutcome || {
+                stepId: stepNum,
+                goal: extractQuery,
+                status: StepStatus.FAILED,
+                actionTaken: 'EXTRACT',
+                verificationPassed: false,
+                usedVision: false,
+                durationMs: Date.now() - stepStart,
+                error: `Could not extract requested data: ${extractQuery}`,
+              }
+            );
           }
         }
       } catch (e) {
@@ -2468,6 +2675,22 @@ export class PlannerExecutorAgent {
 
     // Handle SCROLL_AND_COUNT action — scroll entire page and count items
     if (plannerAction.action === 'SCROLL_AND_COUNT') {
+      if (!isCountingTask(task)) {
+        return {
+          stepId: stepNum,
+          goal: plannerAction.goal || plannerAction.countTarget || 'SCROLL_AND_COUNT',
+          status: StepStatus.FAILED,
+          actionTaken: 'SCROLL_AND_COUNT(rejected_non_counting_task)',
+          verificationPassed: false,
+          usedVision: false,
+          durationMs: Date.now() - stepStart,
+          urlBefore: currentUrl,
+          urlAfter: await runtime.getCurrentUrl(),
+          error:
+            'SCROLL_AND_COUNT is only for counting tasks, not first/top N extraction; use EXTRACT for visible result data.',
+        };
+      }
+
       const countTarget =
         plannerAction.countTarget ||
         plannerAction.goal ||
@@ -3847,6 +4070,196 @@ COUNT:`;
     }
   }
 
+  private findPrimarySearchInput(elements: SnapshotElement[]): SnapshotElement | null {
+    const inputRoles = new Set(['searchbox', 'textbox', 'combobox', 'input']);
+    const candidates = elements.filter(element => {
+      const role = (element.role || '').toLowerCase();
+      if (!inputRoles.has(role)) {
+        return false;
+      }
+
+      const text = `${this.elementText(element)} ${element.name || ''} ${element.ariaLabel || ''}`;
+      return (
+        !/\b(email|newsletter|subscribe|password)\b/i.test(text) &&
+        !/\boptional[_\s-]*field[_\s-]*\d+\b/i.test(text) &&
+        !/\band\s+(?:field|condition|clause)\b/i.test(text)
+      );
+    });
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    const score = (element: SnapshotElement): number => {
+      const role = (element.role || '').toLowerCase();
+      const name = (element.name || '').toLowerCase();
+      const text = this.elementText(element).toLowerCase();
+      let value = 0;
+      if (role === 'searchbox') value += 100;
+      if (/\b(any|all)[_\s-]*(field|fields)\b/.test(`${name} ${text}`)) value += 140;
+      if (name === 'query' || name === 'search') value += 80;
+      if (name === 'q') value += 25;
+      if (/\b(search|query|keyword|terms?)\b/.test(text)) value += 40;
+      if (/\b(optional|advanced|field\d+|and)\b/.test(text)) value -= 50;
+      if (element.isPrimary) value += 20;
+      return value;
+    };
+
+    return [...candidates].sort((a, b) => score(b) - score(a))[0] || null;
+  }
+
+  private findFillFormFilterControl(
+    elements: SnapshotElement[],
+    field: { label: string; value: string },
+    alreadyUsed: Set<number>
+  ): SnapshotElement | null {
+    const value = this.normalizeSearchQueryText(field.value || '');
+    if (!value) {
+      return null;
+    }
+
+    const label = this.normalizeSearchQueryText(field.label || '');
+    const labelTerms = this.normalizedSearchTerms(label).filter(
+      term => !['all', 'any', 'field', 'fields'].includes(term)
+    );
+    const valueTerms = this.normalizedSearchTerms(value);
+    const candidates: Array<{ element: SnapshotElement; score: number }> = [];
+    const clickRoles = new Set([
+      'radio',
+      'checkbox',
+      'option',
+      'menuitem',
+      'button',
+      'select',
+      'combobox',
+    ]);
+
+    for (const element of elements) {
+      if (alreadyUsed.has(element.id)) {
+        continue;
+      }
+
+      const role = (element.role || '').toLowerCase();
+      if (!clickRoles.has(role)) {
+        continue;
+      }
+      if (
+        element.clickable === false &&
+        role !== 'radio' &&
+        role !== 'checkbox' &&
+        role !== 'select'
+      ) {
+        continue;
+      }
+
+      const text = this.normalizeSearchQueryText(this.elementText(element));
+      const terms = this.normalizedSearchTerms(text);
+      const valueMatches =
+        text === value ||
+        terms.includes(value) ||
+        text.includes(value) ||
+        valueTerms.some(term => terms.includes(term) || text.includes(term));
+      if (!valueMatches) {
+        continue;
+      }
+
+      let score = 0;
+      if (role === 'radio' || role === 'checkbox' || role === 'option') score += 100;
+      if (role === 'select' || role === 'combobox') score += 90;
+      if (text === value) score += 60;
+      if (terms.includes(value)) score += 30;
+      if (valueTerms.some(term => terms.includes(term))) score += 30;
+      if (labelTerms.some(term => terms.includes(term) || text.includes(term))) score += 20;
+      if (element.isPrimary) score += 5;
+      candidates.push({ element, score });
+    }
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    return candidates.sort((a, b) => b.score - a.score)[0].element;
+  }
+
+  private normalizedSearchTerms(value: string): string[] {
+    return value
+      .split(/[^a-z0-9]+/)
+      .map(term => term.replace(/s$/, ''))
+      .filter(term => term.length > 0);
+  }
+
+  private getFillFormPrimarySearchValue(
+    task: string,
+    fields: Array<{ label: string; value: string }>
+  ): string | null {
+    if (fields.length === 0) {
+      return null;
+    }
+
+    const values = fields.map(field => (field.value || '').trim()).filter(Boolean);
+    if (values.length === 0) {
+      return null;
+    }
+
+    const query = this.extractSearchQueryFromTask(task);
+    if (!query) {
+      return null;
+    }
+
+    const normalizedQuery = this.normalizeSearchQueryText(query);
+    return values.find(value => this.normalizeSearchQueryText(value) === normalizedQuery) || null;
+  }
+
+  private normalizeSearchQueryText(value: string): string {
+    return value
+      .toLowerCase()
+      .replace(/["'`*_]+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private buildExtractionRequest(task: string, extractQuery: string): string {
+    const taskLower = task.toLowerCase();
+    const queryLower = extractQuery.toLowerCase();
+    const taskHasCountConstraint =
+      /\b(?:first|top|last|latest|earliest|newest|oldest)\s+\d+\b/.test(taskLower) ||
+      /\bexactly\s+\d+\b/.test(taskLower);
+    const queryHasCountConstraint =
+      /\b(?:first|top|last|latest|earliest|newest|oldest)\s+\d+\b/.test(queryLower) ||
+      /\bexactly\s+\d+\b/.test(queryLower);
+
+    if (taskHasCountConstraint && !queryHasCountConstraint && task.trim()) {
+      return `${extractQuery}\nOverall task: ${task}`;
+    }
+
+    return extractQuery;
+  }
+
+  private applyExtractionItemLimit(extractionRequest: string, extractedText: string): string {
+    const match = extractionRequest.match(
+      /\b(first|top|last|latest|earliest|newest|oldest)\s+(\d+)\b/i
+    );
+    if (!match) {
+      return extractedText;
+    }
+
+    const limit = Number.parseInt(match[2], 10);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return extractedText;
+    }
+
+    const lines = extractedText.split(/\r?\n/);
+    const nonEmptyLines = lines.filter(line => line.trim().length > 0);
+    if (nonEmptyLines.length <= limit) {
+      return extractedText;
+    }
+
+    const direction = match[1].toLowerCase();
+    const limited =
+      direction === 'last' ? nonEmptyLines.slice(-limit) : nonEmptyLines.slice(0, limit);
+    return limited.join('\n');
+  }
+
   private promoteVisibleResultClick(
     task: string,
     ctx: SnapshotContext,
@@ -4419,6 +4832,12 @@ COUNT:`;
       );
 
       if (hasRepeatedAction) {
+        const lastUrl = sameHostEntries[sameHostEntries.length - 1].urlAfter;
+        const earlierUrls = sameHostEntries.slice(0, -1).map(e => e.urlAfter);
+        const lastUrlIsNew = lastUrl && !earlierUrls.includes(lastUrl);
+        if (lastUrlIsNew) {
+          continue;
+        }
         return `Action cycle detected: visited ${host} ${count} times with repeated ${sameHostEntries[0].action} actions`;
       }
     }
@@ -4882,12 +5301,11 @@ COUNT:`;
     const candidates: Array<{ id: number; score: number }> = [];
 
     for (const element of elements) {
-      // Only consider buttons and links
       const role = (element.role || '').toLowerCase();
-      if (!['button', 'link'].includes(role)) continue;
+      const isNativeSubmit = role === 'submit' || role === 'button' || role === 'input';
+      if (!['button', 'link', 'submit', 'input'].includes(role)) continue;
 
-      // Skip if not clickable
-      if (element.clickable === false) continue;
+      if (element.clickable === false && !isNativeSubmit) continue;
 
       // Skip the input element itself
       if (element.id === inputElementId) continue;
@@ -4927,14 +5345,18 @@ COUNT:`;
     const lower = targetText.toLowerCase().trim();
     for (const el of elements) {
       const role = (el.role || '').toLowerCase();
-      if (!['button', 'link'].includes(role)) continue;
-      if (el.clickable === false) continue;
+      const isNativeSubmit = role === 'submit' || role === 'button' || role === 'input';
+      if (!['button', 'link', 'submit', 'input'].includes(role)) continue;
+      if (el.clickable === false && !isNativeSubmit) continue;
       const text = (el.text || '').toLowerCase().trim();
+      const name = (el.name || '').toLowerCase().trim();
       const ariaLabel = (el.ariaLabel || '').toLowerCase().trim();
       if (
         text === lower ||
         text.includes(lower) ||
         lower.includes(text) ||
+        name === lower ||
+        name.includes(lower) ||
         ariaLabel.includes(lower)
       ) {
         return el.id;
