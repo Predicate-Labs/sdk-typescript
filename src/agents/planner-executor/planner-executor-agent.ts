@@ -1095,6 +1095,17 @@ export class PlannerExecutorAgent {
         }
 
         plannerAction = this.promoteVisibleResultClick(task, ctx, plannerAction);
+        if (plannerAction.action === 'SCROLL_AND_COUNT' && !isCountingTask(task)) {
+          plannerAction = {
+            action: 'EXTRACT',
+            goal: task,
+            target: task,
+            intent: task,
+            verify: [],
+            reasoning:
+              'SCROLL_AND_COUNT is only valid for total counting tasks; this request asks to extract listed records.',
+          };
+        }
         this.composableHeuristics.setStepHints(plannerAction.heuristicHints || []);
         this.emitPlannerAction(stepNum, plannerAction, plannerActionSource);
 
@@ -1638,6 +1649,17 @@ export class PlannerExecutorAgent {
         }
 
         plannerAction = this.promoteVisibleResultClick(task, ctx, plannerAction);
+        if (plannerAction.action === 'SCROLL_AND_COUNT' && !isCountingTask(task)) {
+          plannerAction = {
+            action: 'EXTRACT',
+            goal: task,
+            target: task,
+            intent: task,
+            verify: [],
+            reasoning:
+              'SCROLL_AND_COUNT is only valid for total counting tasks; this request asks to extract listed records.',
+          };
+        }
         this.composableHeuristics.setStepHints(plannerAction.heuristicHints || []);
         this.emitPlannerAction(stepNum, plannerAction, plannerActionSource);
 
@@ -2478,6 +2500,20 @@ export class PlannerExecutorAgent {
           .replace(/<think[\s\S]*$/gi, '')
           .trim();
 
+      const isSparseExtractionContent = (text: string): boolean => {
+        const normalized = text.replace(/\s+/g, ' ').trim().toLowerCase();
+        if (normalized.length === 0) return true;
+        if (normalized.length > 300) return false;
+        const chromeOnlyPatterns = [
+          /^skip to main content\b/,
+          /\b(sign up|log in|upload|navigation|menu)\b/,
+        ];
+        const hasDataCue = /\b(title|date|result|item|listing|article|price|author|capture)\b/.test(
+          normalized
+        );
+        return chromeOnlyPatterns.some(pattern => pattern.test(normalized)) && !hasDataCue;
+      };
+
       if (this.config.verbose) {
         console.log(`[ACTION] EXTRACT - query: "${extractQuery}"`);
       }
@@ -2492,9 +2528,11 @@ export class PlannerExecutorAgent {
           // Text-based extraction: read page as markdown, then use executor LLM
           const pageContent = await runtime.readMarkdown({ maxChars: 16000 });
 
-          if (!pageContent) {
+          if (!pageContent || isSparseExtractionContent(pageContent)) {
             if (this.config.verbose) {
-              console.log(`  [ACTION] EXTRACT - markdown unavailable, using snapshot context`);
+              console.log(
+                `  [ACTION] EXTRACT - markdown unavailable or too sparse, using fallback context`
+              );
             }
           } else {
             if (this.config.verbose) {

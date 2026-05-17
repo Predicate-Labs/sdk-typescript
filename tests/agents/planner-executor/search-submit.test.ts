@@ -912,7 +912,47 @@ describe('PlannerExecutorAgent search submission parity', () => {
     });
   });
 
-  it('rejects SCROLL_AND_COUNT for first-N extraction tasks without scrolling', async () => {
+  it('treats page-chrome-only markdown as unavailable and uses vision extraction', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles of the first 10 images',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub(['2024-01-01T00:00:00Z - Space image one'], {
+      vision: true,
+    });
+    const runtime = new MarkdownRuntimeStub(
+      'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)',
+      rt => makeSnapshot(rt.currentUrl, [], { screenshot: 'base64-screenshot' }),
+      'Skip to main content (https://example.test/#maincontent)'
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(executor.calls).toHaveLength(0);
+    expect(executor.imageCalls).toHaveLength(1);
+    expect(result.stepOutcomes[0].usedVision).toBe(true);
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2024-01-01T00:00:00Z - Space image one',
+      query: 'capture dates and titles of the first 10 images',
+    });
+  });
+
+  it('coerces SCROLL_AND_COUNT into EXTRACT for first-N extraction tasks without scrolling', async () => {
     const planner = new ProviderStub([
       JSON.stringify({
         action: 'SCROLL_AND_COUNT',
@@ -921,7 +961,7 @@ describe('PlannerExecutorAgent search submission parity', () => {
         verify: [],
       }),
     ]);
-    const executor = new ProviderStub();
+    const executor = new ProviderStub(['2024-01-01T00:00:00Z - Space image one']);
     const runtime = new RuntimeStub(
       'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)',
       rt => makeSnapshot(rt.currentUrl, [{ id: 1, role: 'link', text: 'Space image one' }])
@@ -940,9 +980,13 @@ describe('PlannerExecutorAgent search submission parity', () => {
       task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
     });
 
-    expect(result.success).toBe(false);
-    expect(result.stepOutcomes[0].actionTaken).toBe('SCROLL_AND_COUNT(rejected_non_counting_task)');
-    expect(result.stepOutcomes[0].error).toContain('first/top N extraction');
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0].actionTaken).toBe('EXTRACT');
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2024-01-01T00:00:00Z - Space image one',
+      query:
+        'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
     expect(await runtime.getCurrentUrl()).toBe(
       'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)'
     );
