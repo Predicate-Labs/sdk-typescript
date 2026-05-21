@@ -5057,17 +5057,21 @@ COUNT:`;
 
     const taskLower = task.toLowerCase();
 
-    const isSearchTask =
-      /\b(search|find|look\s*up|go\s*to|navigate\s*to|open|visit|browse)\b/i.test(taskLower);
+    const isSearchTask = /\b(?:search(?:\s+for)?|find|look\s*up)\b/i.test(taskLower);
     if (!isSearchTask) {
       return false;
     }
 
     const hasFollowUpAction =
-      /\b(?:and|then)\s+(?:add|remove|delete|create|update|fill|submit|buy|purchase|add\s+to\s+cart|checkout)\b/i.test(
+      /\b(?:and|then)\s+(?:add|remove|delete|create|update|fill|submit|buy|purchase|add\s+to\s+cart|checkout|continue)\b/i.test(
         taskLower
       );
     if (hasFollowUpAction) {
+      return false;
+    }
+
+    const hasMultiStep = /\b(?:and\s+continue|multi[\s-]?step|then\s+\w+)\b/i.test(taskLower);
+    if (hasMultiStep) {
       return false;
     }
 
