@@ -44,6 +44,7 @@ export const ActionType = z.enum([
   'CLICK',
   'TYPE',
   'TYPE_AND_SUBMIT',
+  'FILL_FORM',
   'SCROLL',
   'SCROLL_AND_COUNT',
   'PRESS',
@@ -65,6 +66,8 @@ export interface PlanStep {
   target?: string;
   intent?: string;
   input?: string;
+  fields?: Array<{ label: string; value: string }>;
+  submitText?: string;
   verify: PredicateSpec[];
   required: boolean;
   stopIfTrue: boolean;
@@ -91,7 +94,7 @@ export const PlanStepSchema = z.lazy(() =>
     id: z.number().optional().describe('Step ID (1-indexed, contiguous)'),
     goal: z.string().optional().describe('Human-readable goal for this step'),
     action: ActionType.describe(
-      'Action type: NAVIGATE, CLICK, TYPE, TYPE_AND_SUBMIT, SCROLL, SCROLL_AND_COUNT, PRESS, WAIT, EXTRACT, STUCK, DONE'
+      'Action type: NAVIGATE, CLICK, TYPE, TYPE_AND_SUBMIT, FILL_FORM, SCROLL, SCROLL_AND_COUNT, PRESS, WAIT, EXTRACT, STUCK, DONE'
     ),
     target: z
       .union([z.string(), z.record(z.string(), z.unknown())])
@@ -99,6 +102,11 @@ export const PlanStepSchema = z.lazy(() =>
       .describe('URL for NAVIGATE action'),
     intent: z.string().optional().describe('Intent hint for CLICK action'),
     input: z.string().optional().describe('Text for TYPE_AND_SUBMIT action'),
+    fields: z
+      .array(z.object({ label: z.string(), value: z.string() }))
+      .optional()
+      .describe('Fields for FILL_FORM action'),
+    submitText: z.string().optional().describe('Submit button text for FILL_FORM action'),
     verify: z.array(PredicateSpecSchema).default([]).describe('Verification predicates'),
     required: z.boolean().default(true).describe('If True, step failure triggers replan'),
     stopIfTrue: z

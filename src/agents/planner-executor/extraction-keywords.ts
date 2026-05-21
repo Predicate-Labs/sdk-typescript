@@ -282,12 +282,62 @@ export function isTextExtractionTask(task: string): boolean {
  * @param extractQuery - What to extract
  * @returns Tuple of [systemPrompt, userPrompt]
  */
-export function buildExtractionPrompt(pageContent: string, extractQuery: string): [string, string] {
-  // NOTE: /no_think MUST be at the START of user message for Qwen3 models.
-  // Without it, Qwen3 puts the answer in <think/> tags and content is empty.
-  const system = `You extract specific text from page content. Return only the extracted text. Do NOT output any thinking, reasoning, or explanation.`;
+function looksLikeJson(text: string): boolean {
+  let trimmed = text.trim();
+  const fenceMatch = trimmed.match(/^`{1,4}\s*\n?([\s\S]*?)(?:\n?`{1,4}\s*)?$/);
+  if (fenceMatch) {
+    trimmed = fenceMatch[1].trim();
+  }
+  return (
+    trimmed.startsWith('{') ||
+    trimmed.startsWith('[') ||
+    trimmed.startsWith('callback(') ||
+    trimmed.startsWith('jsonp(')
+  );
+}
 
-  const user = `/no_think
+function stripJsonp(text: string): string {
+  let trimmed = text.trim();
+  const fenceMatch = trimmed.match(/^`{1,4}\s*\n?([\s\S]*?)(?:\n?`{1,4}\s*)?$/);
+  if (fenceMatch) {
+    trimmed = fenceMatch[1].trim();
+  }
+  const m = trimmed.match(/^(?:callback|jsonp)\s*\(\s*([\s\S]*)\s*\)\s*;?\s*$/);
+  return m ? m[1].trim() : trimmed;
+}
+
+export function buildExtractionPrompt(pageContent: string, extractQuery: string): [string, string] {
+  const isJson = looksLikeJson(pageContent);
+  const contentForPrompt = isJson ? stripJsonp(pageContent) : pageContent;
+
+  let system: string;
+  let user: string;
+
+  if (isJson) {
+    system = `You extract data from JSON content. Return ONLY the extracted data as readable text. Do NOT output any thinking, reasoning, or explanation.`;
+
+    user = `/no_think
+You are a data extraction assistant. The page content below is JSON data from a search API response. Parse the JSON and extract the specific information requested.
+
+JSON CONTENT:
+${contentForPrompt}
+
+EXTRACTION REQUEST:
+${extractQuery}
+
+INSTRUCTIONS:
+1. Parse the JSON structure carefully
+2. Look for the requested fields in the JSON objects (e.g., in "docs", "results", "items", "response.docs", or similar arrays)
+3. If the requested fields exist, extract and format them as readable text
+4. If the request asks for first/top/last N items, return exactly N matching items when available and do not include extra rows
+5. If the JSON does NOT contain the requested fields, list what fields ARE available and return "NOT_FOUND: available fields: <field list>"
+6. Return ONLY the extracted text or the NOT_FOUND message
+
+EXTRACTED TEXT:`;
+  } else {
+    system = `You extract specific text from page content. Return only the extracted text. Do NOT output any thinking, reasoning, or explanation.`;
+
+    user = `/no_think
 You are a text extraction assistant. Given the page content below, extract the specific information requested.
 
 PAGE CONTENT:
@@ -299,10 +349,12 @@ ${extractQuery}
 INSTRUCTIONS:
 1. Read the content carefully
 2. Find and extract ONLY the specific information requested
-3. Return ONLY the extracted text, nothing else
-4. If the information is not found, return "NOT_FOUND"
+3. If the request asks for first/top/last N items, return exactly N matching items when available and do not include extra rows
+4. Return ONLY the extracted text, nothing else
+5. If the information is not found, return "NOT_FOUND"
 
 EXTRACTED TEXT:`;
+  }
 
   return [system, user];
 }
@@ -351,6 +403,8 @@ If the task asks to COUNT items (e.g., "how many listings", "number of results",
 - Set "countTarget" to describe what to count (e.g., "listings", "products", "articles")
 - The system will scroll through the entire page and sum up counts
 - Do NOT use EXTRACT for counting tasks — EXTRACT only sees the current viewport
+- Do NOT use SCROLL_AND_COUNT for "first N", "top N", "latest N", or "oldest N" requests.
+  Those ask for a list of records, not a total count. Use EXTRACT for those.
 
 Example - count all listings:
 Goal: "note how many listings are available"

@@ -68,6 +68,8 @@ Prefer a materially different recovery:
       target: failedStep.target,
       intent: failedStep.intent,
       input: failedStep.input,
+      fields: failedStep.fields,
+      submitText: failedStep.submitText,
       verify: failedStep.verify || [],
       required: failedStep.required !== false,
       optional_substeps: failedStep.optionalSubsteps || [],

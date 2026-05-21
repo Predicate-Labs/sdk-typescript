@@ -9,6 +9,7 @@ import {
   isSearchLikeTypeAndSubmit,
   isUrlChangeRelevantToIntent,
 } from '../../../src/agents/planner-executor/boundary-detection';
+import { ReplanPatchSchema } from '../../../src/agents/planner-executor/plan-models';
 import { normalizeReplanPatch } from '../../../src/agents/planner-executor/plan-utils';
 import type { SnapshotElement } from '../../../src/agents/planner-executor/plan-models';
 
@@ -123,6 +124,7 @@ class RuntimeStub implements AgentRuntime {
   public clickCalls: number[] = [];
   public coordinateClickCalls: Array<{ x: number; y: number }> = [];
   public typeCalls: Array<{ elementId: number; text: string }> = [];
+  public selectCalls: Array<{ elementId: number; value: string }> = [];
   public coordinateTypeCalls: string[] = [];
   public keyCalls: string[] = [];
 
@@ -165,6 +167,10 @@ class RuntimeStub implements AgentRuntime {
     await this.handlers.onType?.(elementId, text, this);
   }
 
+  async selectOption(elementId: number, value: string): Promise<void> {
+    this.selectCalls.push({ elementId, value });
+  }
+
   async typeCoordinate(text: string): Promise<void> {
     this.coordinateTypeCalls.push(text);
   }
@@ -189,6 +195,26 @@ class RuntimeStub implements AgentRuntime {
   }
 }
 
+class MarkdownRuntimeStub extends RuntimeStub {
+  constructor(
+    initialUrl: string,
+    snapshotFactory: (runtime: RuntimeStub) => Snapshot | null,
+    private readonly markdown: string
+  ) {
+    super(initialUrl, snapshotFactory);
+  }
+
+  async readMarkdown(): Promise<string> {
+    return this.markdown;
+  }
+}
+
+class NullMarkdownRuntimeStub extends RuntimeStub {
+  async readMarkdown(): Promise<string | null> {
+    return null;
+  }
+}
+
 function makeSnapshot(
   url: string,
   elements: Snapshot['elements'],
@@ -203,6 +229,892 @@ function makeSnapshot(
 }
 
 describe('PlannerExecutorAgent search submission parity', () => {
+  it('applies search filter controls in mixed FILL_FORM plans before submitting', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [
+          { label: 'any_field', value: 'Space images' },
+          { label: 'All mediatypes', value: 'IMAGES' },
+        ],
+        submitText: 'Search',
+        verify: [{ predicate: 'url_contains', args: ['search'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          {
+            id: 5,
+            role: 'textbox',
+            text: 'optional_field3_q',
+            name: 'optional_field3_q',
+            clickable: false,
+          },
+          { id: 8, role: 'searchbox', text: 'any field', name: 'q', clickable: true },
+          { id: 15, role: 'radio', text: 'texts', name: 'mediatype', nearbyText: 'All mediatypes' },
+          { id: 16, role: 'radio', text: 'image', name: 'mediatype', nearbyText: 'All mediatypes' },
+          { id: 17, role: 'button', text: 'Search', clickable: true },
+        ]),
+      {
+        onClick: (elementId, rt) => {
+          if (elementId === 17) {
+            rt.currentUrl = 'https://example.test/search?q=Space+images&mediatype=image';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.typeCalls).toEqual([{ elementId: 8, text: 'Space images' }]);
+    expect(runtime.clickCalls).toEqual([16, 17]);
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'FILL_FORM(TYPE(8, "Space images") -> CLICK(16, IMAGES) -> CLICK(17))'
+    );
+  });
+
+  it('sets select-style search filters in mixed FILL_FORM plans before submitting', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [
+          { label: 'any_field', value: 'Space images' },
+          { label: 'All mediatypes', value: 'IMAGES' },
+        ],
+        submitText: 'Search',
+        verify: [{ predicate: 'url_contains', args: ['search'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          { id: 8, role: 'searchbox', text: 'any field', name: 'q', clickable: true },
+          {
+            id: 14,
+            role: 'select',
+            text: 'All mediatypes Texts Collection Software Image Audio',
+            name: 'mediatype',
+            nearbyText: 'All mediatypes',
+          },
+          { id: 17, role: 'button', text: 'Search', clickable: true },
+        ]),
+      {
+        onClick: (elementId, rt) => {
+          if (elementId === 17) {
+            rt.currentUrl = 'https://example.test/search?q=Space+images&mediatype=image';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.typeCalls).toEqual([{ elementId: 8, text: 'Space images' }]);
+    expect(runtime.selectCalls).toEqual([{ elementId: 14, value: 'IMAGES' }]);
+    expect(runtime.clickCalls).toEqual([17]);
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'FILL_FORM(TYPE(8, "Space images") -> SELECT(14, IMAGES) -> CLICK(17))'
+    );
+  });
+
+  it('prefers the visible any-field query input over raw q fields in advanced search forms', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [
+          { label: 'any_field', value: 'Space images' },
+          { label: 'All mediatypes', value: 'image' },
+        ],
+        submitText: 'Search',
+        verify: [{ predicate: 'url_contains', args: ['Space'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'filtered search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          { id: 8, role: 'searchbox', text: 'q', name: 'q', clickable: true },
+          { id: 13, role: 'textbox', text: 'any_field', name: 'any_field', clickable: true },
+          {
+            id: 41,
+            role: 'select',
+            text: 'All mediatypes Texts Collection Software Image Audio',
+            name: 'mediatype',
+            nearbyText: 'All mediatypes',
+          },
+          { id: 36, role: 'submit', text: 'Search', name: 'Search', clickable: true },
+        ]),
+      {
+        onClick: (elementId, rt) => {
+          if (elementId === 36) {
+            const typedAnyField = rt.typeCalls.some(
+              call => call.elementId === 13 && call.text === 'Space images'
+            );
+            rt.currentUrl = typedAnyField
+              ? 'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)'
+              : 'https://example.test/search?query=mediatype:(image)';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.typeCalls).toEqual([{ elementId: 13, text: 'Space images' }]);
+    expect(runtime.typeCalls).not.toContainEqual({ elementId: 8, text: 'Space images' });
+    expect(result.stepOutcomes[0].urlAfter).toContain('Space%20images');
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'FILL_FORM(TYPE(13, "Space images") -> SELECT(41, image) -> CLICK(36))'
+    );
+  });
+
+  it('escalates to find an explicit submit control after applying search filters', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [
+          { label: 'any_field', value: 'Space images' },
+          { label: 'All mediatypes', value: 'image' },
+        ],
+        submitText: 'Search',
+        verify: [{ predicate: 'url_contains', args: ['mediatype=image'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'filtered search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    let snapshotCalls = 0;
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt => {
+        snapshotCalls += 1;
+        const baseElements: Snapshot['elements'] = [
+          { id: 8, role: 'searchbox', text: 'any field', name: 'q', clickable: true },
+          {
+            id: 14,
+            role: 'select',
+            text: 'All mediatypes Texts Collection Software Image Audio',
+            name: 'mediatype',
+            nearbyText: 'All mediatypes',
+          },
+        ];
+        return makeSnapshot(
+          rt.currentUrl,
+          snapshotCalls === 1
+            ? baseElements
+            : [...baseElements, { id: 17, role: 'button', text: 'Search', clickable: true }]
+        );
+      },
+      {
+        onClick: (elementId, rt) => {
+          if (elementId === 17) {
+            rt.currentUrl = 'https://example.test/search?q=Space+images&mediatype=image';
+          }
+        },
+        onPressKey: (_key, rt) => {
+          rt.currentUrl = 'https://example.test/search?q=Space+images';
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.selectCalls).toEqual([{ elementId: 14, value: 'image' }]);
+    expect(runtime.clickCalls).toEqual([17]);
+    expect(runtime.keyCalls).toEqual([]);
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'FILL_FORM(TYPE(8, "Space images") -> SELECT(14, image) -> CLICK(17))'
+    );
+  });
+
+  it('treats native submit inputs as explicit submit controls after applying search filters', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [
+          { label: 'any_field', value: 'Space images' },
+          { label: 'All mediatypes', value: 'image' },
+        ],
+        submitText: 'Search',
+        verify: [{ predicate: 'url_contains', args: ['mediatype=image'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'filtered search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          { id: 8, role: 'searchbox', text: 'any field', name: 'q', clickable: true },
+          {
+            id: 14,
+            role: 'select',
+            text: 'All mediatypes Texts Collection Software Image Audio',
+            name: 'mediatype',
+            nearbyText: 'All mediatypes',
+          },
+          { id: 17, role: 'submit', text: 'Search', name: 'Search', clickable: false },
+        ]),
+      {
+        onClick: (elementId, rt) => {
+          if (elementId === 17) {
+            rt.currentUrl = 'https://example.test/search?q=Space+images&mediatype=image';
+          }
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.clickCalls).toEqual([17]);
+    expect(runtime.keyCalls).toEqual([]);
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'FILL_FORM(TYPE(8, "Space images") -> SELECT(14, image) -> CLICK(17))'
+    );
+  });
+
+  it('accepts FILL_FORM repair steps because stepwise execution supports them', () => {
+    const normalized = normalizeReplanPatch({
+      mode: 'patch',
+      replace_steps: [
+        {
+          id: 2,
+          step: {
+            id: 2,
+            action: 'FILL_FORM',
+            fields: [{ label: 'q', value: 'Space images' }],
+            submitText: 'Search',
+            verify: [],
+          },
+        },
+      ],
+    });
+
+    expect(() => ReplanPatchSchema.parse(normalized)).not.toThrow();
+  });
+
+  it('does not submit mixed FILL_FORM search plans when filter fields are unmatched', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [
+          { label: 'q', value: 'Space images' },
+          { label: 'mediatype', value: 'image' },
+        ],
+        submitText: 'Search',
+        verify: [{ predicate: 'url_contains', args: ['Space'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    const runtime = new RuntimeStub('https://example.test/advancedsearch', rt =>
+      makeSnapshot(rt.currentUrl, [
+        {
+          id: 5,
+          role: 'textbox',
+          text: 'optional field 3',
+          name: 'optional_field3_q',
+          clickable: true,
+        },
+        { id: 8, role: 'searchbox', text: 'Search', name: 'q', clickable: true },
+        { id: 9, role: 'button', text: 'Search', clickable: true },
+      ])
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(false);
+    expect(runtime.typeCalls).toEqual([{ elementId: 8, text: 'Space images' }]);
+    expect(runtime.typeCalls).not.toContainEqual({ elementId: 5, text: 'Space images' });
+    expect(runtime.clickCalls).toEqual([]);
+    expect(runtime.keyCalls).toEqual([]);
+    expect(result.stepOutcomes[0].actionTaken).toBe(
+      'FILL_FORM(TYPE(8, "Space images") -> UNMATCHED(mediatype))'
+    );
+  });
+
+  it('routes single-value FILL_FORM search queries to the primary search input, not AND fields', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [{ label: 'optional field 3', value: 'Space images' }],
+        verify: [{ predicate: 'url_contains', args: ['Space'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          { id: 1, role: 'searchbox', text: 'Search', name: 'q', clickable: true },
+          {
+            id: 2,
+            role: 'textbox',
+            text: 'optional field 3',
+            name: 'optional_field3_q',
+            clickable: true,
+          },
+          {
+            id: 3,
+            role: 'textbox',
+            text: 'optional field 4',
+            name: 'optional_field4_q',
+            clickable: true,
+          },
+        ]),
+      {
+        onPressKey: (_key, rt) => {
+          rt.currentUrl = 'https://example.test/search?q=Space+images';
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.typeCalls).toEqual([{ elementId: 1, text: 'Space images' }]);
+    expect(runtime.typeCalls).not.toContainEqual({ elementId: 2, text: 'Space images' });
+    expect(runtime.keyCalls).toEqual(['Enter']);
+    expect(result.stepOutcomes[0].actionTaken).toBe('FILL_FORM(TYPE(1, "Space images") -> ENTER)');
+  });
+
+  it('escalates FILL_FORM search routing instead of typing into visible AND fields', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [{ label: 'optional field 3', value: 'Space images' }],
+        verify: [{ predicate: 'url_contains', args: ['Space'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    let snapshotCalls = 0;
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt => {
+        snapshotCalls += 1;
+        if (snapshotCalls === 1) {
+          return makeSnapshot(rt.currentUrl, [
+            {
+              id: 5,
+              role: 'textbox',
+              text: 'optional field 3',
+              name: 'optional_field3_q',
+              clickable: true,
+            },
+          ]);
+        }
+        return makeSnapshot(rt.currentUrl, [
+          {
+            id: 5,
+            role: 'textbox',
+            text: 'optional field 3',
+            name: 'optional_field3_q',
+            clickable: true,
+          },
+          { id: 8, role: 'searchbox', text: 'Search', name: 'q', clickable: true },
+        ]);
+      },
+      {
+        onPressKey: (_key, rt) => {
+          rt.currentUrl = 'https://example.test/search?q=Space+images';
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.typeCalls).toEqual([{ elementId: 8, text: 'Space images' }]);
+    expect(runtime.typeCalls).not.toContainEqual({ elementId: 5, text: 'Space images' });
+    expect(runtime.keyCalls).toEqual(['Enter']);
+  });
+
+  it('treats duplicate-value FILL_FORM on search pages as a single primary search submission', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'FILL_FORM',
+        fields: [
+          { label: 'optional field 3', value: 'Space images' },
+          { label: 'optional field 4', value: 'Space images' },
+        ],
+        verify: [{ predicate: 'url_contains', args: ['Space'] }],
+      }),
+      JSON.stringify({ action: 'DONE', reasoning: 'search submitted once' }),
+    ]);
+    const executor = new ProviderStub();
+    const runtime = new RuntimeStub(
+      'https://example.test/advancedsearch',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          { id: 1, role: 'searchbox', text: 'Search', name: 'q', clickable: true },
+          {
+            id: 2,
+            role: 'textbox',
+            text: 'optional field 3',
+            name: 'optional_field3_q',
+            clickable: true,
+          },
+          {
+            id: 3,
+            role: 'textbox',
+            text: 'optional field 4',
+            name: 'optional_field4_q',
+            clickable: true,
+          },
+        ]),
+      {
+        onPressKey: (_key, rt) => {
+          rt.currentUrl = 'https://example.test/search?q=Space+images';
+        },
+      }
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(runtime.typeCalls).toEqual([{ elementId: 1, text: 'Space images' }]);
+    expect(runtime.keyCalls).toEqual(['Enter']);
+    expect(result.stepOutcomes[0].actionTaken).toBe('FILL_FORM(TYPE(1, "Space images") -> ENTER)');
+  });
+
+  it('falls back to snapshot content when markdown extraction is unavailable', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles of the first 10 images',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub(['2020-01-01T00:00:00Z - Space photo']);
+    const runtime = new NullMarkdownRuntimeStub('https://example.test/search', rt =>
+      makeSnapshot(rt.currentUrl, [
+        { id: 1, role: 'article', text: '2020-01-01T00:00:00Z - Space photo' },
+      ])
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0].status).toBe(StepStatus.SUCCESS);
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2020-01-01T00:00:00Z - Space photo',
+      query: 'capture dates and titles of the first 10 images',
+    });
+  });
+
+  it('falls back to snapshot content when markdown extraction returns not found', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles of the first 10 images',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub([
+      'NOT_FOUND',
+      '2024-01-01T00:00:00Z - Space image one\n2024-01-02T00:00:00Z - Space image two',
+    ]);
+    const runtime = new MarkdownRuntimeStub(
+      'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)',
+      rt =>
+        makeSnapshot(rt.currentUrl, [
+          { id: 1, role: 'link', text: 'Space image one' },
+          { id: 2, role: 'text', text: '2024-01-01T00:00:00Z' },
+          { id: 3, role: 'link', text: 'Space image two' },
+          { id: 4, role: 'text', text: '2024-01-02T00:00:00Z' },
+        ]),
+      'Search results page'
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(executor.calls).toHaveLength(2);
+    expect(executor.calls[1]?.user).toContain('Space image one');
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2024-01-01T00:00:00Z - Space image one\n2024-01-02T00:00:00Z - Space image two',
+      query: 'capture dates and titles of the first 10 images',
+    });
+  });
+
+  it('uses vision extraction when text context is unavailable but a screenshot is present', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles of the first 10 images',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub(['2024-01-01T00:00:00Z - Space image one'], {
+      vision: true,
+    });
+    const runtime = new NullMarkdownRuntimeStub(
+      'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)',
+      rt => makeSnapshot(rt.currentUrl, [], { screenshot: 'base64-screenshot' })
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(executor.imageCalls).toHaveLength(1);
+    expect(executor.imageCalls[0]?.imageBase64).toBe('base64-screenshot');
+    expect(result.stepOutcomes[0].usedVision).toBe(true);
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2024-01-01T00:00:00Z - Space image one',
+      query: 'capture dates and titles of the first 10 images',
+    });
+  });
+
+  it('treats page-chrome-only markdown as unavailable and uses vision extraction', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles of the first 10 images',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub(['2024-01-01T00:00:00Z - Space image one'], {
+      vision: true,
+    });
+    const runtime = new MarkdownRuntimeStub(
+      'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)',
+      rt => makeSnapshot(rt.currentUrl, [], { screenshot: 'base64-screenshot' }),
+      'Skip to main content (https://example.test/#maincontent)'
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(executor.calls).toHaveLength(0);
+    expect(executor.imageCalls).toHaveLength(1);
+    expect(result.stepOutcomes[0].usedVision).toBe(true);
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2024-01-01T00:00:00Z - Space image one',
+      query: 'capture dates and titles of the first 10 images',
+    });
+  });
+
+  it('coerces SCROLL_AND_COUNT into EXTRACT for first-N extraction tasks without scrolling', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'SCROLL_AND_COUNT',
+        countTarget: 'image listings',
+        goal: 'Count image listings',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub(['2024-01-01T00:00:00Z - Space image one']);
+    const runtime = new RuntimeStub(
+      'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)',
+      rt => makeSnapshot(rt.currentUrl, [{ id: 1, role: 'link', text: 'Space image one' }])
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes[0].actionTaken).toBe('EXTRACT');
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2024-01-01T00:00:00Z - Space image one',
+      query:
+        'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+    expect(await runtime.getCurrentUrl()).toBe(
+      'https://example.test/search?query=(Space%20images)%20AND%20mediatype:(image)'
+    );
+  });
+
+  it('does not rewrite site URLs during extraction', async () => {
+    const currentUrl =
+      'https://archive.org/advancedsearch.php?q=Space+images&fl%5B%5D=identifier&rows=50&page=1&output=json&callback=callback&save=yes';
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles of the first 10 images',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub(['2020-01-01T00:00:00Z - Space photo']);
+    const runtime = new MarkdownRuntimeStub(
+      currentUrl,
+      rt => makeSnapshot(rt.currentUrl, []),
+      'callback({"response":{"docs":[{"date":"2020-01-01T00:00:00Z","title":"Space photo","mediatype":"image"}]}})'
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images on archive.org and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.stepOutcomes).toHaveLength(1);
+    expect(result.stepOutcomes[0].status).toBe(StepStatus.SUCCESS);
+    expect(runtime.gotoCalls).toHaveLength(0);
+    expect(result.stepOutcomes[0].urlAfter).toBe(currentUrl);
+  });
+
+  it('preserves the full task constraints when planner gives a shortened extract goal', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub(['2020-01-01T00:00:00Z - Space photo']);
+    const runtime = new MarkdownRuntimeStub(
+      'https://example.test/search',
+      rt => makeSnapshot(rt.currentUrl, []),
+      '{"response":{"docs":[{"date":"2020-01-01T00:00:00Z","title":"Space photo"}]}}'
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    expect(result.success).toBe(true);
+    expect(executor.calls[0]?.user).toContain('first 10 images listed');
+    expect(executor.calls[0]?.user).toContain('If the request asks for first/top/last N items');
+    expect(result.stepOutcomes[0].extractedData).toEqual({
+      text: '2020-01-01T00:00:00Z - Space photo',
+      query:
+        'capture dates and titles\nOverall task: Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+  });
+
+  it('enforces first N extraction limits when the extractor returns extra rows', async () => {
+    const planner = new ProviderStub([
+      JSON.stringify({
+        action: 'EXTRACT',
+        goal: 'capture dates and titles',
+        verify: [],
+      }),
+    ]);
+    const executor = new ProviderStub([
+      [
+        '1994-04-01T00:00:00Z - Space Radar Image',
+        '1957-05-21T00:00:00Z - Moon Rocket Cantata',
+        '2022-12-02T00:00:00Z - Deltadel Ebro',
+        '2000-12-16T00:00:00Z - Ganymede and Europa',
+        '2001-12-09T00:00:00Z - Praxidike',
+        '2006-01-01T00:00:00Z - photo-jsc2006e15538',
+        '2008-11-13T00:00:00Z - Young Scientist Challenge',
+        '2003-04-03T00:00:00Z - Dusty Star',
+        '1967-05-08T00:00:00Z - Recruiting Brochure',
+        '1967-06-22T00:00:00Z - Breadboard Checkout',
+        '2003-01-01T00:00:00Z - extra row',
+      ].join('\n'),
+    ]);
+    const runtime = new MarkdownRuntimeStub(
+      'https://example.test/search',
+      rt => makeSnapshot(rt.currentUrl, []),
+      '{"response":{"docs":[]}}'
+    );
+
+    const agent = new PlannerExecutorAgent({
+      planner,
+      executor,
+      config: {
+        retry: { verifyTimeoutMs: 20, verifyPollMs: 1, maxReplans: 0, executorRepairAttempts: 1 },
+        recovery: { enabled: false },
+      },
+    });
+
+    const result = await agent.runStepwise(runtime, {
+      task: 'Use advanced search for Space images and output the capture dates and titles of the first 10 images listed.',
+    });
+
+    const text = (result.stepOutcomes[0].extractedData as { text: string }).text;
+    expect(result.success).toBe(true);
+    expect(text.split('\n')).toHaveLength(10);
+    expect(text).not.toContain('extra row');
+  });
+
   it('identifies search-like TYPE_AND_SUBMIT actions and rejects unrelated URL changes', () => {
     const searchbox: SnapshotElement = {
       id: 1,
