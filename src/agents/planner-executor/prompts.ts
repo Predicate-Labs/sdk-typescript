@@ -78,7 +78,10 @@ WHEN TO USE DONE:
 - "Search and click product" task: DONE only AFTER clicking a product link
 - "Search only" task: DONE after search results appear
 - "Log in" task: DONE only AFTER the page navigates away from /login
+- "Search for X" or "Find X" task: DONE after you have navigated to a result page (URL changed away from search results)
+- "Go to X" or "Open X" task: DONE after you are on the target page
 - If goal has multiple steps, complete ALL steps before returning DONE
+- IMPORTANT: If the previous action was CLICK and the URL changed to a new page (not a search results page), the search task is likely DONE. Return DONE instead of taking more actions.
 
 STEP ORDERING:
 - If the task mentions a specific page or URL you are NOT on yet, NAVIGATE there FIRST before doing anything else.

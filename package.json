@@ -1,6 +1,6 @@
 {
   "name": "@predicatesystems/runtime",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "description": "TypeScript SDK for Sentience AI Agent Browser Automation",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

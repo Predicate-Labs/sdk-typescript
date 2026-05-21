@@ -1156,6 +1156,7 @@ export class PlannerExecutorAgent {
         }
 
         // Update current URL
+        const urlBeforeAction = currentUrl;
         let urlAfter = await runtime.getCurrentUrl();
         currentUrl = urlAfter;
         fallbackUsed = fallbackUsed || finalOutcome.usedVision;
@@ -1317,6 +1318,19 @@ export class PlannerExecutorAgent {
             finalOutcome.status === StepStatus.SUCCESS &&
             this.isFinalFormSubmissionAction(task, plannerAction)
           ) {
+            success = true;
+          }
+
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            this.isSearchNavigationComplete(task, plannerAction, urlBeforeAction, urlAfter)
+          ) {
+            if (this.config.verbose) {
+              console.log(
+                `[SEARCH-COMPLETE] Search task appears complete after navigation from ${urlBeforeAction} to ${urlAfter}`
+              );
+            }
             success = true;
           }
 
@@ -1703,6 +1717,7 @@ export class PlannerExecutorAgent {
           // Step outcome callback errors are non-blocking
         }
 
+        const urlBeforeActionResume = currentUrl;
         let urlAfter = await runtime.getCurrentUrl();
         currentUrl = urlAfter;
         fallbackUsed = fallbackUsed || finalOutcome.usedVision;
@@ -1859,6 +1874,19 @@ export class PlannerExecutorAgent {
             finalOutcome.status === StepStatus.SUCCESS &&
             this.isFinalFormSubmissionAction(task, plannerAction)
           ) {
+            success = true;
+          }
+
+          if (
+            !success &&
+            finalOutcome.status === StepStatus.SUCCESS &&
+            this.isSearchNavigationComplete(task, plannerAction, urlBeforeActionResume, urlAfter)
+          ) {
+            if (this.config.verbose) {
+              console.log(
+                `[SEARCH-COMPLETE] Search task appears complete after navigation from ${urlBeforeActionResume} to ${urlAfter}`
+              );
+            }
             success = true;
           }
 
@@ -5014,6 +5042,73 @@ COUNT:`;
       return parsed.pathname.split('/').filter(Boolean).length;
     } catch {
       return href.split('?')[0].split('/').filter(Boolean).length;
+    }
+  }
+
+  private isSearchNavigationComplete(
+    task: string,
+    plannerAction: StepwisePlannerResponse,
+    urlBefore: string,
+    urlAfter: string
+  ): boolean {
+    if (plannerAction.action !== 'CLICK' && plannerAction.action !== 'TYPE_AND_SUBMIT') {
+      return false;
+    }
+
+    const taskLower = task.toLowerCase();
+
+    const isSearchTask = /\b(?:search(?:\s+for)?|find|look\s*up)\b/i.test(taskLower);
+    if (!isSearchTask) {
+      return false;
+    }
+
+    const hasFollowUpAction =
+      /\b(?:and|then)\s+(?:add|remove|delete|create|update|fill|submit|buy|purchase|add\s+to\s+cart|checkout|continue)\b/i.test(
+        taskLower
+      );
+    if (hasFollowUpAction) {
+      return false;
+    }
+
+    const hasMultiStep = /\b(?:and\s+continue|multi[\s-]?step|then\s+\w+)\b/i.test(taskLower);
+    if (hasMultiStep) {
+      return false;
+    }
+
+    if (!urlBefore || !urlAfter || urlBefore === urlAfter) {
+      return false;
+    }
+
+    try {
+      const before = new URL(urlBefore);
+      const after = new URL(urlAfter);
+
+      if (
+        before.origin === after.origin &&
+        before.pathname === after.pathname &&
+        before.search === after.search
+      ) {
+        return false;
+      }
+
+      const domainChanged = before.hostname !== after.hostname;
+      const pathChanged =
+        before.pathname.replace(/\/+$/, '') !== after.pathname.replace(/\/+$/, '');
+
+      if (!domainChanged && !pathChanged) {
+        return false;
+      }
+
+      const stillOnSearchPage =
+        /\/(search|results|listing|s\b|q\b)/i.test(after.pathname) ||
+        /[?&](q|query|search|s)=/i.test(after.search);
+      if (stillOnSearchPage) {
+        return false;
+      }
+
+      return true;
+    } catch {
+      return false;
     }
   }
 
